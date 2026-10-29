@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Network Audio
+Comment=Select network speakers for Linux audio
+Exec=/home/vansh/Projects/network-audio-selector/.venv/bin/network-audio-ui
+Icon=audio-speakers
+Terminal=false
+Categories=AudioVideo;Audio;

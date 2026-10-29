@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local runtime / secrets — never commit
+.local/
+*.cookies
+*.pickle
+.env
+.env.*

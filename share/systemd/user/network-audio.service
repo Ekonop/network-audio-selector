@@ -1,0 +1,10 @@
+[Unit]
+Description=Network Audio virtual sink
+After=pipewire-pulse.service
+
+[Service]
+ExecStart=/home/vansh/Projects/network-audio-selector/.venv/bin/network-audio-service
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

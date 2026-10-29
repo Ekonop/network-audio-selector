@@ -93,6 +93,32 @@ class AlexaConfig:
         return self.cookie_file
 
 
+class AlexaDeviceWrapper:
+    """Wraps an Alexa device dict to satisfy alexapy.AlexaAPI attribute expectations."""
+
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self._raw = raw
+        self._device_type = raw.get("deviceType", "")
+        self.device_serial_number = raw.get("serialNumber", "")
+        self._locale = raw.get("locale", "en-US")
+        self._device_family = raw.get("deviceFamily", "")
+        self._cluster_members = raw.get("clusterMembers", [])
+
+    def __getitem__(self, item: str) -> Any:
+        return self._raw[item]
+
+    def get(self, item: str, default: Any = None) -> Any:
+        return self._raw.get(item, default)
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._raw
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._raw:
+            return self._raw[name]
+        raise AttributeError(f"'AlexaDeviceWrapper' object has no attribute '{name}'")
+
+
 class AlexaBridge:
     """Optional account bridge for Alexa device and multi-room group control.
 
@@ -199,14 +225,14 @@ class AlexaBridge:
             )
         return sorted(result, key=lambda item: item.name.casefold())
 
-    def _device(self, target: str) -> dict[str, Any]:
+    def _device(self, target: str) -> AlexaDeviceWrapper:
         wanted = target.casefold()
         for device in self.devices:
             if (
                 str(device.get("serialNumber", "")).casefold() == wanted
                 or str(device.get("accountName", "")).casefold() == wanted
             ):
-                return device
+                return AlexaDeviceWrapper(device)
         raise ValueError(f"Alexa target not found: {target}")
 
     async def set_volume(self, target: str, volume: float) -> None:

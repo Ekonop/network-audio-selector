@@ -84,3 +84,30 @@ def test_run_in_thread_retains_worker(qapp):
     assert thread._worker == worker
     thread.quit()
     thread.wait(500)
+
+
+def test_alexa_device_wrapper_attributes_and_access():
+    from network_audio_selector.alexa import AlexaDeviceWrapper
+
+    raw = {
+        "deviceType": "A3C94QD08RNTLL",
+        "serialNumber": "G090XG079323049F",
+        "accountName": "Everywhere",
+        "deviceFamily": "WHA",
+        "locale": "en-IN",
+        "clusterMembers": ["DEV1", "DEV2"],
+    }
+    wrapped = AlexaDeviceWrapper(raw)
+
+    # Attributes accessed by alexapy
+    assert wrapped._device_type == "A3C94QD08RNTLL"
+    assert wrapped.device_serial_number == "G090XG079323049F"
+    assert wrapped._device_family == "WHA"
+    assert wrapped._locale == "en-IN"
+    assert wrapped._cluster_members == ["DEV1", "DEV2"]
+
+    # Dict-like operations
+    assert wrapped["accountName"] == "Everywhere"
+    assert wrapped.get("nonexistent", "fallback") == "fallback"
+    assert "deviceType" in wrapped
+    assert wrapped.accountName == "Everywhere"

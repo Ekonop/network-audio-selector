@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from .models import Speaker, SpeakerKind
 
@@ -14,16 +15,38 @@ class RouteResult:
 
 
 class SpeakerBackend:
+    def can_route(self, speaker: Speaker) -> bool:
+        raise NotImplementedError
+
     def route(self, speaker: Speaker, stream_url: str | None = None) -> RouteResult:
         raise NotImplementedError
 
 
 class ChromecastBackend(SpeakerBackend):
+    def can_route(self, speaker: Speaker) -> bool:
+        return speaker.kind is SpeakerKind.CHROMECAST
+
     def route(self, speaker: Speaker, stream_url: str | None = None) -> RouteResult:
+        if stream_url is None:
+            return RouteResult(speaker, False, "A live stream URL is required", stage="missing_url")
+
+        # Validate that remote receiver is not being given loopback or 0.0.0.0
+        parsed = urlparse(stream_url)
+        host = parsed.hostname or ""
+        is_remote = speaker.address and speaker.address not in ("127.0.0.1", "localhost", "::1")
+        if is_remote and (host in ("127.0.0.1", "localhost", "0.0.0.0", "::1")):
+            return RouteResult(
+                speaker,
+                False,
+                f"Stream URL ({stream_url}) uses loopback address and is unreachable by remote Chromecast ({speaker.address})",
+                stage="unreachable_url",
+            )
+
         try:
             import pychromecast
         except ImportError as exc:
             return RouteResult(speaker, False, f"Chromecast support unavailable: {exc}", stage="unsupported")
+
         try:
             devices, browser = pychromecast.get_listed_chromecasts(
                 friendly_names=[speaker.name]
@@ -33,8 +56,6 @@ class ChromecastBackend(SpeakerBackend):
                     return RouteResult(speaker, False, "Chromecast was not reachable", stage="connection_failed")
                 cast = devices[0]
                 cast.wait()
-                if stream_url is None:
-                    return RouteResult(speaker, False, "A live stream URL is required", stage="missing_url")
                 cast.media_controller.play_media(
                     stream_url,
                     "audio/mpeg",
@@ -55,6 +76,9 @@ class ChromecastBackend(SpeakerBackend):
 
 
 class UnsupportedBackend(SpeakerBackend):
+    def can_route(self, speaker: Speaker) -> bool:
+        return False
+
     def route(self, speaker: Speaker, stream_url: str | None = None) -> RouteResult:
         if speaker.kind is SpeakerKind.ALEXA:
             message = (

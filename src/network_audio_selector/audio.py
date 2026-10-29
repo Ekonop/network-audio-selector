@@ -85,16 +85,36 @@ class AudioRouter:
         self._save_state()
         return SINK_NAME
 
+    def _verify_module_for_unload(self, module_id: int) -> bool:
+        """Confirm that module_id exists, is module-null-sink, and owns network_audio_selector."""
+        result = subprocess.run(
+            ["pactl", "list", "short", "modules"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split("\t") if "\t" in line else line.split(None, 2)
+            if len(parts) >= 2:
+                try:
+                    mod_id = int(parts[0].strip())
+                except ValueError:
+                    continue
+                if mod_id == module_id:
+                    mod_type = parts[1].strip()
+                    mod_args = parts[2].strip() if len(parts) >= 3 else ""
+                    return mod_type == "module-null-sink" and f"sink_name={SINK_NAME}" in mod_args
+        return False
+
     def remove_virtual_sink(self) -> None:
         # Load any saved state if we don't have it in memory
         if self.previous_default_sink is None and self.state_file.exists():
             self._load_state()
 
-        # Only unload the module if we created it ourselves
-        if self.created_by_us:
-            module_id = self.module_id or self._existing_module_id()
-            if module_id is not None:
-                subprocess.run(["pactl", "unload-module", str(module_id)], check=False)
+        # Only unload the module if we created it ourselves AND its identity is verified
+        if self.created_by_us and self.module_id is not None:
+            if self._verify_module_for_unload(self.module_id):
+                subprocess.run(["pactl", "unload-module", str(self.module_id)], check=False)
 
         restore = self.previous_default_sink
         if not restore or not self._sink_is_valid(restore):

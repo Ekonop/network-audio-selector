@@ -22,9 +22,10 @@ the system mix to those receivers.
 
 ## Verified Functionality
 
-1. **Virtual PipeWire/PulseAudio Sink & Restoration**:
+1. **Virtual PipeWire/PulseAudio Sink & Module Ownership Validation**:
    - Virtual sink creation: `network_audio_selector` with monitor `network_audio_selector.monitor`.
    - Safely adopts pre-existing virtual sink without destroying it upon exit.
+   - Validates module ownership prior to unloading via `pactl list short modules` (confirming matching ID, `module-null-sink`, and `sink_name=network_audio_selector`) to prevent destroying recycled modules or another application's null sinks.
    - Records and preserves previous default sink in `~/.local/state/network-audio/sink_state.json`.
    - Restores the original physical output on clean shutdown, partial startup failures, or emergency recovery.
    - If previous sink is disconnected, safely falls back to the first available physical sink.
@@ -39,9 +40,10 @@ the system mix to those receivers.
 
 3. **Snapcast Synchronized Audio Pipeline**:
    - Local `snapserver` configuration generated with `Linux System Audio` pipe stream.
+   - Non-blocking FIFO writer with active timeout and crash detection: never falls back to blocking `open("wb")` and raises `SnapcastUnavailable` if Snapserver crashes during startup.
    - FFmpeg captures 48,000 Hz 16-bit stereo PCM from `network_audio_selector.monitor` directly into the FIFO without blocking.
    - FFmpeg startup failures or early exits are caught immediately with stderr diagnostics.
-   - Stale PID files are verified against `/proc/<pid>/cmdline` and reaped safely.
+   - Strict process termination: `_pid_is_process` inspects `/proc/<pid>/comm` and `/proc/<pid>/cmdline` requiring expected names and config/arg markers (`snapserver`, `ffmpeg`, `snapclient`); never terminates unverified or recycled PIDs.
    - Control port conflicts (1705 occupied by an external service) are detected and reported clearly.
    - Local `snapclient` test mode routes audio through the physical hardware sink to avoid loopback feedback.
 
@@ -55,11 +57,17 @@ the system mix to those receivers.
      - `error`: specific failure stage and error details reported.
    - Source probe tone verifies stream transition to `playing` and catches silence vs. broken pipeline.
 
-5. **HTTP MP3 Stream**:
-   - Bound to `127.0.0.1` by default for local testing; explicit warnings documented for untrusted LAN use.
-   - Deterministic shutdown: closes client queues, terminates/kills FFmpeg, joins reader thread, shuts down HTTP server, and joins HTTP thread without deadlock or resource leaks.
+5. **Configurable HTTP MP3 Stream Modes & Reliable Teardown**:
+   - Explicit exposure modes via `StreamMode`:
+     - `loopback`: binds only to `127.0.0.1` (safe default for local testing).
+     - `lan`: binds to the local interface address reachable from the target receiver (resolving local routing to remote receiver IP without relying on 8.8.8.8; never advertises `0.0.0.0` or `127.0.0.1` to remote receivers).
+     - `custom`: caller-specified interface and port.
+   - Remote receivers (like Chromecast) reject loopback or `0.0.0.0` stream URLs.
+   - Queue-full handling and graceful teardown: `_StreamState.close()` drains subscriber queues so poison-pill `None` fits even when queues are full; HTTP handler loops check `state.is_closed` on timed gets to unblock client threads reliably.
 
-6. **Truthful UI and Non-blocking Background Operations**:
+6. **Transactional Routing & Truthful UI**:
+   - Preflight verification: if all selected speakers are unsupported (e.g. Echo Dot or unauthenticated targets), routing fails immediately before modifying audio state (leaving PipeWire, default sink, and local playback unchanged).
+   - Transactional rollback: if routing fails mid-route, any source or stream started by that operation is stopped and previous audio output is restored; pre-existing audio is never stranded.
    - Route button never says `Routing active` if all selected backends fail; displays `Routing failed` with per-device error details.
    - Shows truthful partial routing if some succeed and some fail (`Routing active (X/Y)`).
    - Echo Dot devices and Spotify Connect receivers are explicitly presented as unsupported for arbitrary desktop Linux audio.
@@ -80,7 +88,7 @@ the system mix to those receivers.
 
 ## Reproducing Verification
 
-Run the full automated test suite (27 tests):
+Run the full automated test suite (38 tests):
 
 ```bash
 cd /home/vansh/Projects/network-audio-selector

@@ -36,7 +36,7 @@ from .installer import SnapcastInstallError, install_snapcast
 from .models import Speaker, SpeakerKind
 from .snapcast import SnapcastManager, SnapcastUnavailable
 from .source import PHASE_LABELS, HealthReport, SourceController, SourcePhase
-from .stream import AudioStream
+from .stream import AudioStream, StreamMode
 from .workers import (
     AlexaBrowserSignInWorker,
     AlexaSignInWorker,
@@ -725,16 +725,62 @@ class Selector(QWidget):
         if not selected:
             self._set_status("Select at least one speaker before starting.", error=True)
             return
+
+        # Preflight: Check if any selected speaker can be routed
+        routable = [s for s in selected if backend_for(s).can_route(s)]
+        if not routable:
+            unsupported_reasons = "\n".join(
+                f"• {s.name} ({s.kind.value}): {backend_for(s).route(s).message}"
+                for s in selected
+            )
+            self.route_button.setText("Routing failed")
+            self._set_status(
+                "Routing failed: None of the selected receivers support arbitrary Linux desktop audio.",
+                error=True,
+            )
+            QMessageBox.warning(
+                self,
+                "Unsupported Receivers",
+                "None of the selected receivers can receive arbitrary Linux desktop audio:\n\n"
+                f"{unsupported_reasons}\n\n"
+                "Tip: Use Snapcast with compatible clients for arbitrary system audio.",
+            )
+            return
+
+        # Check if remote LAN streaming is needed
+        chromecast_targets = [s for s in selected if s.kind is SpeakerKind.CHROMECAST]
+        receiver_address = None
+        for c in chromecast_targets:
+            if c.address and c.address not in ("127.0.0.1", "localhost", "::1"):
+                receiver_address = c.address
+                break
+
+        source_was_running = self.source.is_running
+        stream_was_running = self.stream is not None
+
         try:
             if not self.source.is_running:
                 self.source.start()
             if self.stream is None:
-                self.stream = AudioStream()
+                if receiver_address:
+                    self.stream = AudioStream(
+                        mode=StreamMode.LAN,
+                        receiver_address=receiver_address,
+                    )
+                else:
+                    self.stream = AudioStream(mode=StreamMode.LOOPBACK)
                 stream_url = self.stream.start()
             else:
                 stream_url = self.stream.url
             results = [backend_for(speaker).route(speaker, stream_url) for speaker in selected]
         except Exception as exc:
+            # Transactional rollback: stop resources created by this operation
+            if not stream_was_running and self.stream is not None:
+                self.stream.stop()
+                self.stream = None
+            if not source_was_running and self.source.is_running:
+                self.source.stop()
+
             self.route_button.setText("Routing failed")
             self._set_status(f"Routing failed: {exc}", error=True)
             self.refresh_health()
@@ -744,6 +790,13 @@ class Selector(QWidget):
         failed = [result for result in results if not result.ok]
 
         if not succeeded:
+            # Complete failure: rollback resources started by this operation
+            if not stream_was_running and self.stream is not None:
+                self.stream.stop()
+                self.stream = None
+            if not source_was_running and self.source.is_running:
+                self.source.stop()
+
             self.route_button.setText("Routing failed")
             failure_lines = [f"{r.speaker.name}: {r.message}" for r in failed]
             self._set_status("Routing failed: " + " · ".join(failure_lines), error=True)

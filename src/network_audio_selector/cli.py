@@ -8,9 +8,10 @@ from .audio import AudioRouter
 from .backends import backend_for
 from .discovery import discover_sync
 from .installer import SnapcastInstallError, install_snapcast
+from .models import SpeakerKind
 from .snapcast import SnapcastManager, SnapcastUnavailable
 from .source import PHASE_LABELS, SourceController
-from .stream import AudioStream
+from .stream import AudioStream, StreamMode
 
 
 def _print_health(controller: SourceController) -> None:
@@ -30,7 +31,16 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("devices", help="discover network speakers")
     sub.add_parser("enable", help="create the Network Audio virtual sink")
-    sub.add_parser("stream", help="start a live HTTP audio stream")
+    stream_parser = sub.add_parser("stream", help="start a live HTTP audio stream")
+    stream_parser.add_argument(
+        "--mode",
+        choices=["loopback", "lan", "custom"],
+        default="loopback",
+        help="network exposure mode (default: loopback)",
+    )
+    stream_parser.add_argument("--bind", default=None, help="explicit bind address")
+    stream_parser.add_argument("--port", type=int, default=0, help="stream port")
+
     source = sub.add_parser("source", help="manage the source state machine")
     source.add_argument(
         "action",
@@ -115,7 +125,14 @@ def main() -> None:
         return
     if args.command == "stream":
         router.create_virtual_sink()
-        stream = AudioStream()
+        stream_mode = StreamMode(args.mode)
+        stream = AudioStream(
+            port=args.port,
+            bind_address=args.bind,
+            mode=stream_mode,
+        )
+        if stream_mode is not StreamMode.LOOPBACK:
+            print("WARNING: Live HTTP stream is unauthenticated and unencrypted.", flush=True)
         print(stream.start(), flush=True)
         try:
             while True:
@@ -161,13 +178,38 @@ def main() -> None:
     selected = [s for s in speakers if s.name.casefold() in wanted]
     if not selected:
         raise SystemExit("No requested speakers were discovered.")
+
+    # Preflight check: reject if none can be routed
+    routable = [s for s in selected if backend_for(s).can_route(s)]
+    if not routable:
+        for s in selected:
+            print(f"{s.name}: {backend_for(s).route(s).message}")
+        raise SystemExit("None of the requested speakers support arbitrary system audio.")
+
+    # Check for remote Chromecast receiver
+    receiver_address = None
+    for c in selected:
+        if c.kind is SpeakerKind.CHROMECAST and c.address and c.address not in ("127.0.0.1", "localhost", "::1"):
+            receiver_address = c.address
+            break
+
     controller.start()
-    stream = AudioStream()
+    if receiver_address:
+        print("WARNING: Opening unauthenticated LAN stream for remote receiver.", flush=True)
+        stream = AudioStream(mode=StreamMode.LAN, receiver_address=receiver_address)
+    else:
+        stream = AudioStream(mode=StreamMode.LOOPBACK)
+
     stream_url = stream.start()
     try:
-        for speaker in selected:
-            result = backend_for(speaker).route(speaker, stream_url)
-            print(f"{speaker.name}: {result.message}")
+        results = [backend_for(speaker).route(speaker, stream_url) for speaker in selected]
+        succeeded = [r for r in results if r.ok]
+        for r in results:
+            print(f"{r.speaker.name}: {r.message}")
+        if not succeeded:
+            stream.stop()
+            controller.stop()
+            raise SystemExit("Routing failed for all selected speakers.")
         print("Streaming. Press Ctrl-C to stop.", flush=True)
         while True:
             input()

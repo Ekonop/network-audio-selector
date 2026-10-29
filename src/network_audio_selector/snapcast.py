@@ -95,8 +95,12 @@ class SnapcastManager:
         )
         self._write_pid(self.server_pid_file, self.server.pid)
 
-        # Open FIFO write end with timeout check so we never freeze
-        fifo_writer = self._open_fifo_writer(timeout=2.0)
+        # Open FIFO write end with non-blocking check and explicit timeout
+        try:
+            fifo_writer = self._open_fifo_writer(timeout=2.0)
+        except Exception:
+            self.stop()
+            raise
 
         self.encoder = subprocess.Popen(
             [
@@ -146,6 +150,11 @@ class SnapcastManager:
     def _open_fifo_writer(self, timeout: float = 2.0) -> IO[bytes]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if self.server is not None and self.server.poll() is not None:
+                err = self._read_stderr(self.server)
+                raise SnapcastUnavailable(
+                    f"Snapserver exited while waiting for audio FIFO: {err or 'unknown error'}"
+                )
             try:
                 fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
                 fl = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -153,15 +162,24 @@ class SnapcastManager:
                 return os.fdopen(fd, "wb")
             except OSError:
                 time.sleep(0.05)
-        return self.fifo.open("wb")
+        raise SnapcastUnavailable(
+            f"Timeout waiting for Snapserver to open audio FIFO ({self.fifo}) for reading."
+        )
 
     def stop(self) -> None:
         self.stop_local_client()
-        for process, pid_file in (
-            (self.encoder, self.encoder_pid_file),
-            (self.server, self.server_pid_file),
-        ):
-            self._terminate(process, pid_file)
+        self._terminate(
+            self.encoder,
+            self.encoder_pid_file,
+            expected_name="ffmpeg",
+            arg_marker="network_audio_selector.monitor",
+        )
+        self._terminate(
+            self.server,
+            self.server_pid_file,
+            expected_name="snapserver",
+            config_marker=str(self.config),
+        )
         self.encoder = None
         self.server = None
         self._kill_matching_config_servers()
@@ -206,7 +224,12 @@ class SnapcastManager:
         return f"Local Snapclient connected to 127.0.0.1, playing through {target}."
 
     def stop_local_client(self) -> None:
-        self._terminate(self.local_client, self.client_pid_file)
+        self._terminate(
+            self.local_client,
+            self.client_pid_file,
+            expected_name="snapclient",
+            arg_marker="127.0.0.1",
+        )
         self.local_client = None
 
     def status(self) -> str:
@@ -253,7 +276,7 @@ class SnapcastManager:
         if self.server is not None and self.server.poll() is None:
             return True
         pid = self._read_pid(self.server_pid_file)
-        if pid is not None and self._pid_is_process(pid, "snapserver", str(self.config)):
+        if pid is not None and self._pid_is_process(pid, "snapserver", config_marker=str(self.config)):
             return True
         return False
 
@@ -276,33 +299,39 @@ class SnapcastManager:
 
     def _adopt_running(self) -> None:
         pid = self._read_pid(self.server_pid_file)
-        if pid is not None and self._pid_is_process(pid, "snapserver", str(self.config)):
+        if pid is not None and self._pid_is_process(pid, "snapserver", config_marker=str(self.config)):
             self.server = None  # managed via pid file
         encoder_pid = self._read_pid(self.encoder_pid_file)
-        if encoder_pid is not None and self._pid_is_process(encoder_pid, "ffmpeg"):
+        if encoder_pid is not None and self._pid_is_process(
+            encoder_pid, "ffmpeg", arg_marker="network_audio_selector.monitor"
+        ):
             self.encoder = None
 
     def _encoder_alive(self) -> bool:
         if self.encoder is not None and self.encoder.poll() is None:
             return True
         pid = self._read_pid(self.encoder_pid_file)
-        return pid is not None and self._pid_is_process(pid, "ffmpeg")
+        return pid is not None and self._pid_is_process(
+            pid, "ffmpeg", arg_marker="network_audio_selector.monitor"
+        )
 
     def _client_alive(self) -> bool:
         if self.local_client is not None and self.local_client.poll() is None:
             return True
         pid = self._read_pid(self.client_pid_file)
-        return pid is not None and self._pid_is_process(pid, "snapclient")
+        return pid is not None and self._pid_is_process(pid, "snapclient", arg_marker="127.0.0.1")
 
     def _reap_stale_managed_processes(self) -> None:
         checks = (
-            (self.encoder_pid_file, "ffmpeg", None),
-            (self.server_pid_file, "snapserver", str(self.config)),
-            (self.client_pid_file, "snapclient", None),
+            (self.encoder_pid_file, "ffmpeg", None, "network_audio_selector.monitor"),
+            (self.server_pid_file, "snapserver", str(self.config), None),
+            (self.client_pid_file, "snapclient", None, "127.0.0.1"),
         )
-        for pid_file, name, marker in checks:
+        for pid_file, name, config_marker, arg_marker in checks:
             pid = self._read_pid(pid_file)
-            if pid is not None and not self._pid_is_process(pid, name, marker):
+            if pid is not None and not self._pid_is_process(
+                pid, name, config_marker=config_marker, arg_marker=arg_marker
+            ):
                 pid_file.unlink(missing_ok=True)
 
     def _kill_matching_config_servers(self) -> None:
@@ -325,7 +354,7 @@ class SnapcastManager:
                 pid = int(pid_text)
             except ValueError:
                 continue
-            if self._pid_is_process(pid, "snapserver", marker):
+            if self._pid_is_process(pid, "snapserver", config_marker=marker):
                 self._signal_pid(pid, signal.SIGTERM)
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and self._port_open(self.CONTROL_HOST, self.CONTROL_PORT):
@@ -338,7 +367,7 @@ class SnapcastManager:
                 pid = int(pid_text)
             except ValueError:
                 continue
-            if self._pid_is_process(pid, "snapserver", marker):
+            if self._pid_is_process(pid, "snapserver", config_marker=marker):
                 self._signal_pid(pid, signal.SIGKILL)
 
     @staticmethod
@@ -399,7 +428,16 @@ class SnapcastManager:
             return None
 
     @classmethod
-    def _pid_is_process(cls, pid: int, expected_name: str, config_marker: str | None = None) -> bool:
+    def _pid_is_process(
+        cls,
+        pid: int,
+        expected_name: str,
+        config_marker: str | None = None,
+        arg_marker: str | None = None,
+    ) -> bool:
+        if not expected_name or not expected_name.strip():
+            return False
+
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, PermissionError):
@@ -408,6 +446,7 @@ class SnapcastManager:
         # On Linux, inspect /proc/{pid}/comm and /proc/{pid}/cmdline
         comm_file = Path(f"/proc/{pid}/comm")
         cmdline_file = Path(f"/proc/{pid}/cmdline")
+
         if comm_file.exists():
             try:
                 comm = comm_file.read_text(encoding="utf-8", errors="replace").strip()
@@ -416,10 +455,14 @@ class SnapcastManager:
             except (OSError, ProcessLookupError):
                 return False
 
-        if config_marker is not None and cmdline_file.exists():
+        if cmdline_file.exists():
             try:
                 cmdline = cmdline_file.read_text(encoding="utf-8", errors="replace")
-                if config_marker not in cmdline:
+                if expected_name not in cmdline and comm_file.exists() and expected_name not in comm_file.read_text(encoding="utf-8", errors="replace"):
+                    return False
+                if config_marker is not None and config_marker not in cmdline:
+                    return False
+                if arg_marker is not None and arg_marker not in cmdline:
                     return False
             except (OSError, ProcessLookupError):
                 return False
@@ -444,7 +487,14 @@ class SnapcastManager:
             return ""
         return data.decode("utf-8", errors="replace").strip()
 
-    def _terminate(self, process: subprocess.Popen[bytes] | None, pid_file: Path) -> None:
+    def _terminate(
+        self,
+        process: subprocess.Popen[bytes] | None,
+        pid_file: Path,
+        expected_name: str,
+        config_marker: str | None = None,
+        arg_marker: str | None = None,
+    ) -> None:
         pid = self._read_pid(pid_file)
         if process is not None:
             pid = process.pid
@@ -473,13 +523,28 @@ class SnapcastManager:
                     process.stderr.close()
                 except Exception:
                     pass
-        elif pid is not None and self._pid_is_process(pid, ""):
+        elif (
+            pid is not None
+            and self._pid_is_process(
+                pid, expected_name, config_marker=config_marker, arg_marker=arg_marker
+            )
+        ):
             self._signal_pid(pid, signal.SIGTERM)
             deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and self._pid_is_process(pid, ""):
+            while (
+                time.monotonic() < deadline
+                and self._pid_is_process(
+                    pid, expected_name, config_marker=config_marker, arg_marker=arg_marker
+                )
+            ):
                 time.sleep(0.1)
-            if self._pid_is_process(pid, ""):
+            if self._pid_is_process(
+                pid, expected_name, config_marker=config_marker, arg_marker=arg_marker
+            ):
                 self._signal_pid(pid, signal.SIGKILL)
+        else:
+            # Identity not confirmed; do NOT terminate arbitrary process
+            pass
         pid_file.unlink(missing_ok=True)
 
     @staticmethod

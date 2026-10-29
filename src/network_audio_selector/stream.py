@@ -5,10 +5,45 @@ import socket
 import subprocess
 import threading
 import time
+from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import IO
 
 from .audio import SINK_NAME
+
+
+class StreamMode(StrEnum):
+    LOOPBACK = "loopback"
+    LAN = "lan"
+    CUSTOM = "custom"
+
+
+def get_source_ip_for_target(target_ip: str) -> str:
+    """Determine the local source IP address that routes to target_ip."""
+    if not target_ip:
+        return get_default_lan_ip()
+    is_ipv6 = ":" in target_ip
+    sock_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+    probe = socket.socket(sock_family, socket.SOCK_DGRAM)
+    try:
+        probe.connect((target_ip, 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return get_default_lan_ip()
+    finally:
+        probe.close()
+
+
+def get_default_lan_ip() -> str:
+    """Best-effort discovery of primary local LAN IP address."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
 
 
 class _StreamState:
@@ -16,6 +51,12 @@ class _StreamState:
         self.clients: set[queue.Queue[bytes | None]] = set()
         self.lock = threading.Lock()
         self._closed = False
+        self._stop_event = threading.Event()
+
+    @property
+    def is_closed(self) -> bool:
+        with self.lock:
+            return self._closed
 
     def add(self) -> queue.Queue[bytes | None]:
         client: queue.Queue[bytes | None] = queue.Queue(maxsize=32)
@@ -43,10 +84,20 @@ class _StreamState:
 
     def close(self) -> None:
         with self.lock:
+            if self._closed:
+                return
             self._closed = True
+            self._stop_event.set()
             clients = tuple(self.clients)
             self.clients.clear()
+
+        # Unblock all client handlers: drain any pending audio so None is guaranteed to fit
         for client in clients:
+            while not client.empty():
+                try:
+                    client.get_nowait()
+                except queue.Empty:
+                    break
             try:
                 client.put_nowait(None)
             except queue.Full:
@@ -67,8 +118,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
-            while True:
-                chunk = client.get()
+            while not self.server.state.is_closed:
+                try:
+                    chunk = client.get(timeout=0.2)
+                except queue.Empty:
+                    continue
                 if chunk is None:
                     return
                 self.wfile.write(chunk)
@@ -94,14 +148,60 @@ class _AudioHTTPServer(ThreadingHTTPServer):
 class AudioStream:
     """Encode the virtual sink monitor once and fan it out to network clients.
 
+    Exposure modes:
+    - LOOPBACK: listens on 127.0.0.1 for local testing.
+    - LAN: listens on a local address reachable by the selected receiver.
+    - CUSTOM: binds to an explicit address provided by caller.
+
     WARNING: This HTTP MP3 stream has no authentication or encryption.
-    It defaults to binding on 127.0.0.1 for local testing. If bound to a LAN
-    address, only expose it to trusted private networks.
+    Do not expose it on untrusted public networks.
     """
 
-    def __init__(self, port: int = 0, bind_address: str = "127.0.0.1") -> None:
+    def __init__(
+        self,
+        port: int = 0,
+        bind_address: str | None = None,
+        mode: StreamMode = StreamMode.LOOPBACK,
+        receiver_address: str | None = None,
+    ) -> None:
         self.port = port
-        self.bind_address = bind_address
+        self.mode = mode
+        self.receiver_address = receiver_address
+
+        if mode is StreamMode.LOOPBACK:
+            self.bind_address = bind_address or "127.0.0.1"
+            self.advertised_host = "127.0.0.1"
+        elif mode is StreamMode.LAN:
+            if bind_address:
+                self.bind_address = bind_address
+            elif receiver_address:
+                self.bind_address = get_source_ip_for_target(receiver_address)
+            else:
+                self.bind_address = get_default_lan_ip()
+
+            if self.bind_address == "0.0.0.0":
+                self.advertised_host = (
+                    get_source_ip_for_target(receiver_address)
+                    if receiver_address
+                    else get_default_lan_ip()
+                )
+            else:
+                self.advertised_host = self.bind_address
+        elif mode is StreamMode.CUSTOM:
+            if not bind_address:
+                raise ValueError("A bind_address must be provided when mode is CUSTOM")
+            self.bind_address = bind_address
+            if bind_address == "0.0.0.0":
+                self.advertised_host = (
+                    get_source_ip_for_target(receiver_address)
+                    if receiver_address
+                    else get_default_lan_ip()
+                )
+            else:
+                self.advertised_host = bind_address
+        else:
+            raise ValueError(f"Unsupported StreamMode: {mode}")
+
         self._state = _StreamState()
         self._server: _AudioHTTPServer | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -112,7 +212,9 @@ class AudioStream:
     def url(self) -> str:
         if self._server is None:
             raise RuntimeError("Audio stream is not started")
-        host = self.bind_address if self.bind_address != "0.0.0.0" else self._local_ip()
+        host = self.advertised_host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         return f"http://{host}:{self._server.server_port}/audio.mp3"
 
     def start(self) -> str:
@@ -234,14 +336,3 @@ class AudioStream:
             if self._http_thread.is_alive():
                 self._http_thread.join(timeout=2)
             self._http_thread = None
-
-    @staticmethod
-    def _local_ip() -> str:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            probe.connect(("8.8.8.8", 80))
-            return probe.getsockname()[0]
-        except OSError:
-            return "127.0.0.1"
-        finally:
-            probe.close()

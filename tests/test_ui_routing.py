@@ -128,3 +128,76 @@ def test_alexa_worker_runs_in_background(qapp):
         targets = finished_mock.call_args[0][0]
         assert len(targets) == 1
         assert targets[0].name == "Echo Dot"
+
+
+def test_ui_preflight_does_not_touch_source_when_all_unsupported(qapp):
+    with patch.object(Selector, "refresh"):
+        selector = Selector()
+    selector.source = MagicMock()
+    selector.stream = None
+
+    spk = Speaker(id="alexa:1", name="Echo Dot", kind=SpeakerKind.ALEXA)
+    item = QListWidgetItem()
+    item.setData(Qt.ItemDataRole.UserRole, spk)
+    item.setCheckState(Qt.CheckState.Checked)
+    selector.devices.addItem(item)
+
+    with patch("network_audio_selector.ui.QMessageBox.warning"):
+        selector.route()
+
+    # Audio source and virtual sink must NOT have been started
+    selector.source.start.assert_not_called()
+    assert selector.stream is None
+    selector.close()
+
+
+def test_ui_route_transactional_rollback_when_backend_fails(qapp):
+    fake_health = HealthReport(
+        phase=SourcePhase.TRANSPORT_ACTIVE,
+        sink_exists=True,
+        sink_is_default=True,
+        snapserver_running=True,
+        ffmpeg_running=True,
+        stream_status="playing",
+        detail="Active",
+    )
+    with patch.object(Selector, "refresh"):
+        selector = Selector()
+    selector.source = MagicMock()
+    selector.source.is_running = False
+    def mock_start():
+        selector.source.is_running = True
+        return fake_health
+    selector.source.start.side_effect = mock_start
+    selector.source.health.return_value = fake_health
+
+    spk = Speaker(
+        id="chromecast:1",
+        name="Living Room TV",
+        kind=SpeakerKind.CHROMECAST,
+        address="192.168.1.50",
+    )
+    item = QListWidgetItem()
+    item.setData(Qt.ItemDataRole.UserRole, spk)
+    item.setCheckState(Qt.CheckState.Checked)
+    selector.devices.addItem(item)
+
+    mock_chromecast_backend = MagicMock()
+    mock_chromecast_backend.can_route.return_value = True
+    mock_chromecast_backend.route.return_value = RouteResult(spk, False, "Connection timed out")
+
+    with patch("network_audio_selector.ui.backend_for", return_value=mock_chromecast_backend), \
+         patch("network_audio_selector.ui.AudioStream") as mock_stream_cls, \
+         patch("network_audio_selector.ui.QMessageBox.warning"):
+        mock_stream = MagicMock()
+        mock_stream.start.return_value = "http://192.168.1.10:8000/audio.mp3"
+        mock_stream_cls.return_value = mock_stream
+
+        selector.route()
+
+        # Since backend failed and source was not running prior to route, rollback must stop source & stream
+        selector.source.stop.assert_called_once()
+        mock_stream.stop.assert_called_once()
+        assert selector.route_button.text() == "Routing failed"
+
+    selector.close()

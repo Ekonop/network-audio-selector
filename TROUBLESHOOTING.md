@@ -52,6 +52,9 @@ PipeWire may suspend the null sink monitor during silence, returning the stream 
 State is persisted safely in `~/.local/state/network-audio/sink_state.json`.
 - When `network_audio_selector` is created, the previous default sink and creation ownership (`created_by_us`) are saved.
 - If `network_audio_selector` pre-existed or belongs to another process, Network Audio adopts it safely and **does not** unload it upon shutdown.
+- Before unloading a module via `pactl unload-module`, Network Audio inspects `pactl list short modules` to verify that the module ID still corresponds to `module-null-sink` with `sink_name=network_audio_selector`. This prevents killing recycled module IDs or another process's audio modules.
+- Preflight validation: If only unsupported receivers are selected, routing fails before touching PipeWire or creating sinks.
+- Transactional rollback: If routing fails mid-route, any source or stream started by that attempt is cleanly stopped and the original physical sink is restored.
 - When stopping or on partial startup failure, the previous default output is restored automatically.
 - If the previous sink is no longer available (e.g. disconnected USB DAC), Network Audio falls back to the first available physical sink.
 
@@ -61,11 +64,12 @@ pactl list short sinks
 pactl set-default-sink <physical-sink-name>
 ```
 
-### 5. Snapcast process ownership and port conflicts
+### 5. Snapcast process ownership, FIFO handling, and port conflicts
 
+- Non-blocking FIFO writer: Network Audio opens the PCM audio FIFO using non-blocking I/O and bounded timeouts. It actively checks if `snapserver` has crashed, immediately raising `SnapcastUnavailable` rather than hanging on a blocking open.
 - Control port 1705: Network Audio only manages Snapserver processes started with its configuration (`~/.local/state/network-audio/snapserver.conf`).
 - If an unmanaged service already occupies port 1705, Network Audio will refuse to start and will report a clear port conflict error rather than adopting or terminating the unrelated process.
-- Stale PID files in `~/.local/state/network-audio/` are validated against `/proc/<pid>/comm` and `/proc/<pid>/cmdline` and reaped if the PID has been recycled by another process.
+- Strict process termination: Stale PID files in `~/.local/state/network-audio/` are validated against `/proc/<pid>/comm` and `/proc/<pid>/cmdline` requiring expected names and config/arg markers (`snapserver`, `ffmpeg`, `snapclient`). Reaped or recycled PIDs are never signaled.
 - FFmpeg capture errors (e.g. missing sink monitor) are detected immediately and reported with the process stderr.
 
 ### 6. Alexa account targets vs. arbitrary audio
@@ -75,12 +79,15 @@ pactl set-default-sink <physical-sink-name>
 - In the UI, selecting unsupported devices will keep the route button truthful: if all selected backends fail, the button displays `Routing failed` (never `Routing active`).
 - Alexa credential sign-in and browser OAuth URL exchanges execute asynchronously in background worker threads (`AlexaSignInWorker`, `AlexaBrowserSignInWorker`), preventing the Qt main thread from freezing.
 
-### 7. HTTP MP3 live stream
+### 7. HTTP MP3 live stream and exposure modes
 
-The HTTP MP3 stream is a compatibility experiment.
-- Binds to `127.0.0.1` by default for local testing.
-- WARNING: The HTTP stream has no encryption or authentication; do not expose it on untrusted public networks.
-- Start/stop cycles are deterministic and cleanly release threads, sockets, and FFmpeg subprocesses without resource leaks.
+The HTTP MP3 stream is a compatibility transport.
+- Explicit modes:
+  - `loopback`: Binds strictly to `127.0.0.1` (safe default for local testing).
+  - `lan`: Determines the route to the destination receiver's IP and binds to that local interface IP. Remote receivers (e.g. Chromecast) reject loopback or `0.0.0.0` addresses.
+  - `custom`: Binds to a user-provided `--bind` address.
+- WARNING: The HTTP stream has no encryption or authentication; clear warnings are shown before exposing unauthenticated audio to the LAN.
+- Start/stop cycles are deterministic and cleanly release threads, sockets, and FFmpeg subprocesses. Subscriber queues are drained on shutdown to prevent worker threads from hanging on full queues.
 
 ### 8. Useful logs and runtime state
 

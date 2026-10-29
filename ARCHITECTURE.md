@@ -61,20 +61,27 @@ supported transport is independently established.
 
 ### HTTP MP3
 
-The HTTP stream is a compatibility experiment for receivers that can pull a
-live MP3 URL. It is unauthenticated and has no encryption. It is not suitable
-for untrusted networks and is not synchronized like Snapcast.
+The HTTP stream is a compatibility transport for receivers that can pull a
+live MP3 URL (such as Chromecast).
 
-## Lifecycle
+It provides three exposure modes via `StreamMode`:
+- `loopback`: listens strictly on `127.0.0.1` (default, safe for local testing).
+- `lan`: listens on the local interface address reachable from the target receiver's IP address (without blind binding or 8.8.8.8 assumptions; never advertises `0.0.0.0` or `127.0.0.1` to remote receivers).
+- `custom`: caller-configured bind address and port.
 
-1. Create the virtual sink.
-2. Save the previous default sink.
+It is unauthenticated and has no encryption; clear security warnings are displayed before opening network listeners. Remote receivers reject loopback stream URLs. Graceful teardown drains client queues and unblocks handler loops on shutdown.
+
+## Lifecycle and Transactional Rollback
+
+1. **Preflight verification**: Before altering system audio, verify that at least one selected receiver supports arbitrary system routing. If only unsupported targets (e.g. Echo Dot) are selected, abort without creating virtual sinks or touching PipeWire.
+2. Create the virtual sink and record module ownership and prior default output.
 3. Set `network_audio_selector` as the default output.
-4. Start the selected transport.
+4. Start the selected transport (Snapcast FIFO/FFmpeg, or HTTP MP3).
 5. Confirm transport and receiver health.
-6. Stop transport.
-7. Unload the virtual sink.
-8. Restore the previous default sink.
+6. **Transactional rollback**: If transport or backend routing fails, stop newly created resources and restore the user's prior physical output immediately.
+7. Stop transport with strict PID/marker validation.
+8. Unload the virtual sink only after verifying that the module ID in `pactl list short modules` matches `module-null-sink` and `sink_name=network_audio_selector`.
+9. Restore the previous default sink.
 
 `SourceController` exposes these as phases: `idle` → `source_active` →
 `transport_active` → `receiver_connected` → `playback_confirmed`. The UI and

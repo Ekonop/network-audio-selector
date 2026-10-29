@@ -106,3 +106,77 @@ def test_snapcast_local_client_failure(tmp_path):
         with pytest.raises(SnapcastUnavailable) as exc:
             mgr.start_local_client()
         assert "Local Snapclient exited immediately" in str(exc.value)
+
+
+def test_open_fifo_writer_raises_when_server_exits(tmp_path):
+    mgr = SnapcastManager(state_dir=tmp_path)
+    mgr.fifo = tmp_path / "test.fifo"
+    import os
+    os.mkfifo(mgr.fifo)
+
+    fake_server = MagicMock()
+    fake_server.poll.return_value = 1
+    mgr.server = fake_server
+
+    with patch.object(mgr, "_read_stderr", return_value="FIFO config error"):
+        with pytest.raises(SnapcastUnavailable) as exc:
+            mgr._open_fifo_writer(timeout=0.2)
+        assert "Snapserver exited while waiting for audio FIFO" in str(exc.value)
+
+
+def test_open_fifo_writer_raises_on_timeout(tmp_path):
+    mgr = SnapcastManager(state_dir=tmp_path)
+    mgr.fifo = tmp_path / "test.fifo"
+    import os
+    os.mkfifo(mgr.fifo)
+
+    fake_server = MagicMock()
+    fake_server.poll.return_value = None
+    mgr.server = fake_server
+
+    # Without a reader, opening O_NONBLOCK | O_WRONLY will raise ENXIO
+    with pytest.raises(SnapcastUnavailable) as exc:
+        mgr._open_fifo_writer(timeout=0.1)
+    assert "Timeout waiting for Snapserver to open audio FIFO" in str(exc.value)
+
+
+def test_terminate_never_kills_unverified_recycled_pids(tmp_path):
+    mgr = SnapcastManager(state_dir=tmp_path)
+    pid_file = tmp_path / "stale_snapserver.pid"
+    pid_file.write_text("12345\n")
+
+    with patch.object(mgr, "_pid_is_process", return_value=False), \
+         patch.object(mgr, "_signal_pid") as mock_signal:
+
+        mgr._terminate(
+            None,
+            pid_file,
+            expected_name="snapserver",
+            config_marker=str(mgr.config),
+        )
+
+        # Must NOT send SIGTERM or SIGKILL to unverified PID 12345
+        mock_signal.assert_not_called()
+        # Stale PID file is cleaned up
+        assert not pid_file.exists()
+
+
+def test_terminate_signals_verified_pid(tmp_path):
+    mgr = SnapcastManager(state_dir=tmp_path)
+    pid_file = tmp_path / "verified_snapserver.pid"
+    pid_file.write_text("12345\n")
+
+    # First call returns True (process exists), subsequent calls return False (process exited after SIGTERM)
+    with patch.object(mgr, "_pid_is_process", side_effect=[True, False, False]), \
+         patch.object(mgr, "_signal_pid") as mock_signal:
+
+        mgr._terminate(
+            None,
+            pid_file,
+            expected_name="snapserver",
+            config_marker=str(mgr.config),
+        )
+
+        import signal
+        mock_signal.assert_called_once_with(12345, signal.SIGTERM)
+        assert not pid_file.exists()

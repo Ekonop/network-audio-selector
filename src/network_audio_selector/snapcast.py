@@ -147,7 +147,7 @@ class SnapcastManager:
         self.stop()
         raise SnapcastUnavailable("Snapserver started but control port 1705 never became ready.")
 
-    def _open_fifo_writer(self, timeout: float = 2.0) -> IO[bytes]:
+    def _open_fifo_writer(self, timeout: float = 5.0) -> IO[bytes]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.server is not None and self.server.poll() is not None:
@@ -156,9 +156,8 @@ class SnapcastManager:
                     f"Snapserver exited while waiting for audio FIFO: {err or 'unknown error'}"
                 )
             try:
-                fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
-                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+                # Opening a FIFO with O_RDWR avoids blocking and ENXIO while reader initializes
+                fd = os.open(self.fifo, os.O_RDWR)
                 return os.fdopen(fd, "wb")
             except OSError:
                 time.sleep(0.05)

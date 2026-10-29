@@ -15,13 +15,13 @@ class AlexaVerificationRequired(RuntimeError):
     """Amazon requires a one-time verification code to continue."""
 
 
-def alexa_login_url(identifier: str, domain: str | None = None) -> str:
-    """Create an Amazon OAuth URL without handling the account password."""
+def alexa_login_url(identifier: str, domain: str | None = None) -> tuple[str, str, str]:
+    """Create an Amazon OAuth URL returning (url, code_verifier, uuid) so PKCE matches."""
     from alexapy import AlexaLogin
 
     target_domain = domain or os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com")
 
-    async def build() -> str:
+    async def build() -> tuple[str, str, str]:
         login = AlexaLogin(
             target_domain,
             identifier,
@@ -29,7 +29,7 @@ def alexa_login_url(identifier: str, domain: str | None = None) -> str:
             lambda filename: filename,
         )
         try:
-            return str(login.start_url)
+            return str(login.start_url), str(login.code_verifier), str(login.uuid)
         finally:
             await login.close()
 
@@ -247,7 +247,11 @@ def alexa_sign_in_sync(
 
 
 def alexa_browser_sign_in_sync(
-    identifier: str, redirect_url: str, domain: str = "amazon.com"
+    identifier: str,
+    redirect_url: str,
+    domain: str = "amazon.com",
+    code_verifier: str | None = None,
+    uuid: str | None = None,
 ) -> list[Speaker]:
     async def run() -> list[Speaker]:
         from alexapy import AlexaAPI, AlexaLogin
@@ -286,7 +290,10 @@ def alexa_browser_sign_in_sync(
             identifier,
             "",
             lambda filename: str(config.cookie_dir / Path(filename).name),
+            uuid=uuid,
         )
+        if code_verifier:
+            login.code_verifier = code_verifier
         try:
             login.authorization_code = authorization_code
             if not await login.get_tokens():

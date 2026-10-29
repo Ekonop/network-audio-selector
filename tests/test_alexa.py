@@ -40,11 +40,15 @@ def test_alexa_config_from_environment(tmp_path):
 def test_alexa_login_url_with_phone_and_domain():
     fake_login = MagicMock()
     fake_login.start_url = "https://www.amazon.in/ap/signin?openid.mode=checkid_setup"
+    fake_login.code_verifier = "TESTVERIFIER"
+    fake_login.uuid = "TESTUUID"
     fake_login.close = AsyncMock()
 
     with patch("alexapy.AlexaLogin", return_value=fake_login):
-        url = alexa_login_url("+919876543210", domain="amazon.in")
+        url, verifier, uuid = alexa_login_url("+919876543210", domain="amazon.in")
         assert "amazon.in" in url
+        assert verifier == "TESTVERIFIER"
+        assert uuid == "TESTUUID"
 
 
 def test_alexa_browser_sign_in_url_parsing():

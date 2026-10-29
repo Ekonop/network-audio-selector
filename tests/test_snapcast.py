@@ -127,17 +127,15 @@ def test_open_fifo_writer_raises_when_server_exits(tmp_path):
 def test_open_fifo_writer_raises_on_timeout(tmp_path):
     mgr = SnapcastManager(state_dir=tmp_path)
     mgr.fifo = tmp_path / "test.fifo"
-    import os
-    os.mkfifo(mgr.fifo)
 
     fake_server = MagicMock()
     fake_server.poll.return_value = None
     mgr.server = fake_server
 
-    # Without a reader, opening O_NONBLOCK | O_WRONLY will raise ENXIO
-    with pytest.raises(SnapcastUnavailable) as exc:
-        mgr._open_fifo_writer(timeout=0.1)
-    assert "Timeout waiting for Snapserver to open audio FIFO" in str(exc.value)
+    with patch("os.open", side_effect=OSError("FIFO open failure")):
+        with pytest.raises(SnapcastUnavailable) as exc:
+            mgr._open_fifo_writer(timeout=0.1)
+        assert "Timeout waiting for Snapserver to open audio FIFO" in str(exc.value)
 
 
 def test_terminate_never_kills_unverified_recycled_pids(tmp_path):

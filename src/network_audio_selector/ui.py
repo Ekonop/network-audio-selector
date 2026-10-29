@@ -559,7 +559,7 @@ class Selector(QWidget):
                 "URL and paste it back here."
             )
         try:
-            url = alexa_login_url(identifier, domain=domain)
+            url, code_verifier, uuid = alexa_login_url(identifier, domain=domain)
         except Exception as exc:
             self._set_status(f"Could not create Amazon login: {exc}", error=True)
             return
@@ -586,7 +586,11 @@ class Selector(QWidget):
         self._set_status("Completing Alexa connection in background…", busy=True)
         self.alexa_button.setEnabled(False)
         worker = AlexaBrowserSignInWorker(
-            identifier, redirect_url.strip(), domain=domain
+            identifier,
+            redirect_url.strip(),
+            domain=domain,
+            code_verifier=code_verifier,
+            uuid=uuid,
         )
         worker.finished.connect(self._on_alexa_targets)
         worker.failed.connect(self._on_alexa_failed)

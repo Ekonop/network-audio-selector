@@ -81,18 +81,29 @@ class AlexaBrowserSignInWorker(QObject):
     failed = pyqtSignal(str)
 
     def __init__(
-        self, identifier: str, redirect_url: str, domain: str = "amazon.com"
+        self,
+        identifier: str,
+        redirect_url: str,
+        domain: str = "amazon.com",
+        code_verifier: str | None = None,
+        uuid: str | None = None,
     ) -> None:
         super().__init__()
         self.identifier = identifier
         self.email = identifier  # backwards compatibility
         self.redirect_url = redirect_url
         self.domain = domain
+        self.code_verifier = code_verifier
+        self.uuid = uuid
 
     def run(self) -> None:
         try:
             targets = alexa_browser_sign_in_sync(
-                self.identifier, self.redirect_url, domain=self.domain
+                self.identifier,
+                self.redirect_url,
+                domain=self.domain,
+                code_verifier=self.code_verifier,
+                uuid=self.uuid,
             )
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))

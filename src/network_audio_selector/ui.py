@@ -333,6 +333,14 @@ class Selector(QWidget):
             item.setCheckState(Qt.CheckState.Unchecked)
             self.devices.addItem(item)
 
+    def _run_worker(self, worker: QObject) -> QThread:
+        thread, _ = run_in_thread(worker)
+        self._threads.append(thread)
+        thread.finished.connect(
+            lambda: self._threads.remove(thread) if thread in self._threads else None
+        )
+        return thread
+
     def refresh(self) -> None:
         if self._busy:
             return
@@ -344,8 +352,7 @@ class Selector(QWidget):
         worker = DiscoveryWorker()
         worker.finished.connect(self._on_discovery_finished)
         worker.failed.connect(self._on_discovery_failed)
-        thread, _ = run_in_thread(worker)
-        self._threads.append(thread)
+        self._run_worker(worker)
 
     def _on_discovery_finished(self, speakers: list) -> None:
         self._busy = False
@@ -389,17 +396,70 @@ class Selector(QWidget):
         self._set_status(f"Discovery failed: {message}", error=True)
 
     def load_alexa_targets(self) -> None:
-        email, accepted = QInputDialog.getText(
-            self,
-            "Connect Alexa account",
-            "Amazon account email:",
-            QLineEdit.EchoMode.Normal,
-            os.environ.get("NETWORK_AUDIO_ALEXA_EMAIL", ""),
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Connect Alexa account")
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+
+        info = QLabel(
+            "Enter your Amazon account email or mobile phone number to connect your Alexa devices and groups."
         )
-        if not accepted or not email.strip():
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        id_input = QLineEdit()
+        saved_id = (
+            os.environ.get("NETWORK_AUDIO_ALEXA_EMAIL", "")
+            or os.environ.get("NETWORK_AUDIO_ALEXA_PHONE", "")
+            or os.environ.get("NETWORK_AUDIO_ALEXA_IDENTIFIER", "")
+        )
+        id_input.setText(saved_id)
+        id_input.setPlaceholderText("e.g. user@example.com or +919876543210")
+        form.addRow("Email or phone number:", id_input)
+
+        region_combo = QComboBox()
+        regions = [
+            ("amazon.in", "India (amazon.in)"),
+            ("amazon.com", "United States / Global (amazon.com)"),
+            ("amazon.co.uk", "United Kingdom (amazon.co.uk)"),
+            ("amazon.de", "Germany (amazon.de)"),
+            ("amazon.ca", "Canada (amazon.ca)"),
+            ("amazon.fr", "France (amazon.fr)"),
+            ("amazon.co.jp", "Japan (amazon.co.jp)"),
+            ("amazon.com.au", "Australia (amazon.com.au)"),
+        ]
+        for domain, label in regions:
+            region_combo.addItem(label, domain)
+
+        current_domain = os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.in")
+        found_idx = region_combo.findData(current_domain)
+        if found_idx >= 0:
+            region_combo.setCurrentIndex(found_idx)
+        form.addRow("Amazon region:", region_combo)
+        layout.addLayout(form)
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addWidget(btn_box)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        os.environ["NETWORK_AUDIO_ALEXA_EMAIL"] = email.strip()
-        config = AlexaConfig.from_environment()
+
+        identifier = id_input.text().strip()
+        if not identifier:
+            return
+
+        selected_domain = str(region_combo.currentData())
+        os.environ["NETWORK_AUDIO_ALEXA_IDENTIFIER"] = identifier
+        os.environ["NETWORK_AUDIO_ALEXA_EMAIL"] = identifier
+        os.environ["NETWORK_AUDIO_ALEXA_PHONE"] = identifier
+        os.environ["NETWORK_AUDIO_ALEXA_DOMAIN"] = selected_domain
+
+        config = AlexaConfig(identifier=identifier, domain=selected_domain)
         if not config.cookie_file.exists():
             choice = QMessageBox(self)
             choice.setWindowTitle("Set up Alexa")
@@ -422,10 +482,10 @@ class Selector(QWidget):
             choice.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
             choice.exec()
             if choice.clickedButton() is sign_in_button:
-                self._browser_sign_in_alexa(email.strip())
+                self._browser_sign_in_alexa(identifier, domain=selected_domain)
                 return
             if choice.clickedButton() is alexa_app_button:
-                self._browser_sign_in_alexa(email.strip(), use_app=True)
+                self._browser_sign_in_alexa(identifier, domain=selected_domain, use_app=True)
                 return
             if choice.clickedButton() is not import_button:
                 return
@@ -436,8 +496,7 @@ class Selector(QWidget):
         worker = AlexaTargetsWorker()
         worker.finished.connect(self._on_alexa_targets)
         worker.failed.connect(self._on_alexa_failed)
-        thread, _ = run_in_thread(worker)
-        self._threads.append(thread)
+        self._run_worker(worker)
 
     def _on_alexa_targets(self, targets: list) -> None:
         self.alexa_button.setEnabled(True)
@@ -448,7 +507,7 @@ class Selector(QWidget):
 
     def _on_alexa_failed(self, message: str) -> None:
         self.alexa_button.setEnabled(True)
-        self._set_status(message, error=True)
+        self._set_status(f"Alexa account unavailable: {message}", error=True)
         QMessageBox.warning(self, "Alexa account unavailable", message)
 
     def _import_alexa_app_session(self, config: AlexaConfig) -> bool:
@@ -482,7 +541,9 @@ class Selector(QWidget):
             return False
         return True
 
-    def _browser_sign_in_alexa(self, email: str, *, use_app: bool = False) -> None:
+    def _browser_sign_in_alexa(
+        self, identifier: str, domain: str = "amazon.com", *, use_app: bool = False
+    ) -> None:
         if use_app:
             prompt = (
                 "Amazon login will open in your browser.\n\n"
@@ -498,7 +559,7 @@ class Selector(QWidget):
                 "URL and paste it back here."
             )
         try:
-            url = alexa_login_url(email)
+            url = alexa_login_url(identifier, domain=domain)
         except Exception as exc:
             self._set_status(f"Could not create Amazon login: {exc}", error=True)
             return
@@ -524,34 +585,20 @@ class Selector(QWidget):
             return
         self._set_status("Completing Alexa connection in background…", busy=True)
         self.alexa_button.setEnabled(False)
-        worker = AlexaBrowserSignInWorker(email, redirect_url.strip())
+        worker = AlexaBrowserSignInWorker(
+            identifier, redirect_url.strip(), domain=domain
+        )
         worker.finished.connect(self._on_alexa_targets)
         worker.failed.connect(self._on_alexa_failed)
-        thread, _ = run_in_thread(worker)
-        self._threads.append(thread)
+        self._run_worker(worker)
 
-    def _sign_in_alexa(self, email: str) -> None:
+    def _sign_in_alexa(self, identifier: str, domain: str = "amazon.com") -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Sign in with Amazon")
         form = QFormLayout(dialog)
         password = QLineEdit()
         password.setEchoMode(QLineEdit.EchoMode.Password)
-        region = QComboBox()
-        regions = {
-            "amazon.com": "United States / Canada",
-            "amazon.in": "India",
-            "amazon.co.uk": "United Kingdom",
-            "amazon.de": "Germany",
-            "amazon.fr": "France",
-            "amazon.co.jp": "Japan",
-            "amazon.com.au": "Australia",
-        }
-        for domain, label in regions.items():
-            region.addItem(label, domain)
-        current_domain = os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com")
-        region.setCurrentIndex(max(0, region.findData(current_domain)))
         form.addRow("Amazon password", password)
-        form.addRow("Amazon region", region)
         note = QLabel(
             "Amazon will request a verification code only if needed. "
             "Your password is used only for this sign-in and is not saved."
@@ -567,22 +614,38 @@ class Selector(QWidget):
         form.addRow(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted or not password.text():
             return
-        os.environ["NETWORK_AUDIO_ALEXA_DOMAIN"] = region.currentData()
-        self._start_alexa_credential_signin(email, password.text())
+        self._start_alexa_credential_signin(
+            identifier, password.text(), domain=domain
+        )
 
-    def _start_alexa_credential_signin(self, email: str, password: str, code: str = "") -> None:
+    def _start_alexa_credential_signin(
+        self,
+        identifier: str,
+        password: str,
+        code: str = "",
+        domain: str = "amazon.com",
+    ) -> None:
         self._set_status("Signing in to Amazon in background…", busy=True)
         self.alexa_button.setEnabled(False)
-        worker = AlexaSignInWorker(email, password, code)
+        worker = AlexaSignInWorker(
+            identifier, password, code, domain=domain
+        )
         worker.finished.connect(self._on_alexa_targets)
         worker.failed.connect(self._on_alexa_failed)
         worker.verification_required.connect(
-            lambda msg: self._on_alexa_verification_required(email, password, msg)
+            lambda msg: self._on_alexa_verification_required(
+                identifier, password, msg, domain=domain
+            )
         )
-        thread, _ = run_in_thread(worker)
-        self._threads.append(thread)
+        self._run_worker(worker)
 
-    def _on_alexa_verification_required(self, email: str, password: str, message: str) -> None:
+    def _on_alexa_verification_required(
+        self,
+        identifier: str,
+        password: str,
+        message: str,
+        domain: str = "amazon.com",
+    ) -> None:
         self.alexa_button.setEnabled(True)
         code, accepted = QInputDialog.getText(
             self,
@@ -593,7 +656,9 @@ class Selector(QWidget):
         if not accepted or not code.strip():
             self._set_status("Amazon verification was cancelled.", error=True)
             return
-        self._start_alexa_credential_signin(email, password, code.strip())
+        self._start_alexa_credential_signin(
+            identifier, password, code.strip(), domain=domain
+        )
 
     def start_source(self) -> None:
         if self._busy:
@@ -604,8 +669,7 @@ class Selector(QWidget):
         worker = SourceStartWorker(self.source)
         worker.finished.connect(self._on_source_started)
         worker.failed.connect(self._on_source_start_failed)
-        thread, _ = run_in_thread(worker)
-        self._threads.append(thread)
+        self._run_worker(worker)
 
     def _on_source_started(self, report: object) -> None:
         self._busy = False
@@ -649,8 +713,7 @@ class Selector(QWidget):
         worker = SourceStopWorker(self.source)
         worker.finished.connect(self._on_source_stopped)
         worker.failed.connect(self._on_source_stop_failed)
-        thread, _ = run_in_thread(worker)
-        self._threads.append(thread)
+        self._run_worker(worker)
 
     def _on_source_stopped(self, report: object) -> None:
         self._busy = False
@@ -869,9 +932,12 @@ class Selector(QWidget):
     def closeEvent(self, event) -> None:  # noqa: N802
         self._health_timer.stop()
         for thread in list(self._threads):
-            if hasattr(thread, "isRunning") and thread.isRunning():
-                thread.quit()
-                thread.wait(500)
+            try:
+                if hasattr(thread, "isRunning") and thread.isRunning():
+                    thread.quit()
+                    thread.wait(500)
+            except RuntimeError:
+                pass
         self._threads.clear()
         if self.stream is not None:
             self.stream.stop()

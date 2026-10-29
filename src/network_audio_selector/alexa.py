@@ -15,14 +15,16 @@ class AlexaVerificationRequired(RuntimeError):
     """Amazon requires a one-time verification code to continue."""
 
 
-def alexa_login_url(email: str) -> str:
+def alexa_login_url(identifier: str, domain: str | None = None) -> str:
     """Create an Amazon OAuth URL without handling the account password."""
     from alexapy import AlexaLogin
 
+    target_domain = domain or os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com")
+
     async def build() -> str:
         login = AlexaLogin(
-            os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com"),
-            email,
+            target_domain,
+            identifier,
             "",
             lambda filename: filename,
         )
@@ -36,19 +38,28 @@ def alexa_login_url(email: str) -> str:
 
 @dataclass(frozen=True)
 class AlexaConfig:
-    email: str
+    identifier: str
     domain: str = "amazon.com"
     cookie_dir: Path = Path("~/.config/network-audio/alexa").expanduser()
 
+    @property
+    def email(self) -> str:
+        """Alias for backward compatibility."""
+        return self.identifier
+
     @classmethod
     def from_environment(cls) -> "AlexaConfig":
-        email = os.environ.get("NETWORK_AUDIO_ALEXA_EMAIL", "").strip()
-        if not email:
+        identifier = (
+            os.environ.get("NETWORK_AUDIO_ALEXA_IDENTIFIER", "").strip()
+            or os.environ.get("NETWORK_AUDIO_ALEXA_EMAIL", "").strip()
+            or os.environ.get("NETWORK_AUDIO_ALEXA_PHONE", "").strip()
+        )
+        if not identifier:
             raise RuntimeError(
-                "Set NETWORK_AUDIO_ALEXA_EMAIL before using Alexa account control."
+                "Set NETWORK_AUDIO_ALEXA_EMAIL or NETWORK_AUDIO_ALEXA_PHONE before using Alexa account control."
             )
         return cls(
-            email=email,
+            identifier=identifier,
             domain=os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com").strip(),
             cookie_dir=Path(
                 os.environ.get(
@@ -60,7 +71,8 @@ class AlexaConfig:
 
     @property
     def cookie_file(self) -> Path:
-        return self.cookie_dir / f"alexa_media.{self.email}.cookies"
+        safe_id = "".join(c if c.isalnum() or c in ".-_@" else "_" for c in self.identifier)
+        return self.cookie_dir / f"alexa_media.{safe_id}.cookies"
 
     def import_cookie(self, source: Path) -> Path:
         if not source.is_file():
@@ -216,13 +228,13 @@ def alexa_targets_sync() -> list[Speaker]:
 
 
 def alexa_sign_in_sync(
-    email: str, password: str, securitycode: str = ""
+    identifier: str, password: str, securitycode: str = "", domain: str = "amazon.com"
 ) -> list[Speaker]:
     async def run() -> list[Speaker]:
         bridge = AlexaBridge(
             AlexaConfig(
-                email=email,
-                domain=os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com"),
+                identifier=identifier,
+                domain=domain,
             )
         )
         try:
@@ -234,20 +246,36 @@ def alexa_sign_in_sync(
     return asyncio.run(run())
 
 
-def alexa_browser_sign_in_sync(email: str, redirect_url: str) -> list[Speaker]:
+def alexa_browser_sign_in_sync(
+    identifier: str, redirect_url: str, domain: str = "amazon.com"
+) -> list[Speaker]:
     async def run() -> list[Speaker]:
         from alexapy import AlexaAPI, AlexaLogin
 
         config = AlexaConfig(
-            email=email,
-            domain=os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com"),
+            identifier=identifier,
+            domain=domain,
         )
         parsed = urlparse(redirect_url.strip())
         query = parse_qs(parsed.query)
+        fragment_query = parse_qs(parsed.fragment)
         authorization_code = (
             query.get("openid.oa2.authorization_code", [None])[0]
             or query.get("authorization_code", [None])[0]
+            or query.get("code", [None])[0]
+            or fragment_query.get("openid.oa2.authorization_code", [None])[0]
+            or fragment_query.get("authorization_code", [None])[0]
+            or fragment_query.get("code", [None])[0]
         )
+        if not authorization_code:
+            stripped = redirect_url.strip()
+            if "authorization_code=" in stripped:
+                authorization_code = stripped.split("authorization_code=", 1)[1].split("&")[0].split("#")[0]
+            elif "code=" in stripped:
+                authorization_code = stripped.split("code=", 1)[1].split("&")[0].split("#")[0]
+            elif len(stripped) > 20 and "/" not in stripped and "=" not in stripped:
+                authorization_code = stripped
+
         if not authorization_code:
             raise RuntimeError(
                 "The Amazon redirect URL did not contain an authorization code."
@@ -255,7 +283,7 @@ def alexa_browser_sign_in_sync(email: str, redirect_url: str) -> list[Speaker]:
         config.cookie_dir.mkdir(parents=True, exist_ok=True)
         login = AlexaLogin(
             config.domain,
-            email,
+            identifier,
             "",
             lambda filename: str(config.cookie_dir / Path(filename).name),
         )
@@ -278,20 +306,22 @@ def alexa_browser_sign_in_sync(email: str, redirect_url: str) -> list[Speaker]:
     return asyncio.run(run())
 
 
-def alexa_proxy_sign_in_sync(email: str, timeout: int = 300) -> list[Speaker]:
+def alexa_proxy_sign_in_sync(
+    identifier: str, timeout: int = 300, domain: str = "amazon.com"
+) -> list[Speaker]:
     """Authenticate in the browser and capture the Alexa redirect locally."""
 
     async def run() -> list[Speaker]:
         from alexapy import AlexaAPI, AlexaLogin, AlexaProxy
 
         config = AlexaConfig(
-            email=email,
-            domain=os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com"),
+            identifier=identifier,
+            domain=domain,
         )
         config.cookie_dir.mkdir(parents=True, exist_ok=True)
         login = AlexaLogin(
             config.domain,
-            email,
+            identifier,
             "",
             lambda filename: str(config.cookie_dir / Path(filename).name),
         )

@@ -930,6 +930,9 @@ class Selector(QWidget):
             lines.append("Clients: none")
         if report.local_client_running:
             lines.append("Local test client: running")
+        if report.snapserver_running:
+            from .stream import get_default_lan_ip
+            lines.append(f"Snapcast Wi-Fi endpoint: {get_default_lan_ip()}:1704")
         lines.append(report.detail)
         self.health_label.setText("\n".join(lines))
 

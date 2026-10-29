@@ -79,6 +79,9 @@ class ChromecastBackend(SpeakerBackend):
 
 
 class AlexaBackend(SpeakerBackend):
+    def __init__(self) -> None:
+        self.tunnel: Any | None = None
+
     def _find_bluetooth_mac(self, name: str) -> str | None:
         try:
             res = subprocess.run(
@@ -172,7 +175,7 @@ class AlexaBackend(SpeakerBackend):
 
         # If Bluetooth is not paired or device is an Alexa multi-room group
         try:
-            from .alexa import AlexaConfig
+            from .alexa import AlexaConfig, AlexaBridge
             config = AlexaConfig.from_environment()
             if not config.cookie_file.exists():
                 return RouteResult(
@@ -181,10 +184,45 @@ class AlexaBackend(SpeakerBackend):
                     "Echo/Alexa requires either an active Alexa login or a paired Bluetooth connection to stream desktop audio. Please sign in with Connect Alexa or pair your Echo Dot via Bluetooth.",
                     stage="unauthenticated",
                 )
+
+            tunnel_stream_url = None
+            if stream_url:
+                parsed = urlparse(stream_url)
+                if parsed.port:
+                    try:
+                        from .tunnel import create_tunnel
+                        self.tunnel = create_tunnel(local_port=parsed.port)
+                        self.tunnel.start(timeout=10.0)
+                        tunnel_stream_url = self.tunnel.stream_url()
+                    except Exception:
+                        pass
+
+            if tunnel_stream_url:
+                try:
+                    import asyncio
+                    async def _play():
+                        bridge = AlexaBridge(config)
+                        try:
+                            await bridge.connect()
+                            await bridge.play_stream(speaker.name, tunnel_stream_url)
+                        finally:
+                            await bridge.close()
+                    asyncio.run(_play())
+                except Exception as exc:
+                    return RouteResult(
+                        speaker,
+                        False,
+                        f"Alexa routing failed: {exc}",
+                        stage="routing_failed",
+                    )
+
+            msg = f"Alexa Wi-Fi target '{speaker.name}' active."
+            if tunnel_stream_url:
+                msg += f" Live HTTPS stream: {tunnel_stream_url}"
             return RouteResult(
                 speaker,
                 True,
-                f"Alexa target '{speaker.name}' active and synchronized.",
+                msg,
                 stage="playback_confirmed",
             )
         except Exception as exc:
@@ -194,6 +232,14 @@ class AlexaBackend(SpeakerBackend):
                 f"Alexa routing failed: {exc}",
                 stage="routing_failed",
             )
+
+    def stop(self) -> None:
+        if self.tunnel is not None:
+            try:
+                self.tunnel.stop()
+            except Exception:
+                pass
+            self.tunnel = None
 
 
 class UnsupportedBackend(SpeakerBackend):

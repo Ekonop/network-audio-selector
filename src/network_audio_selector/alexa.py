@@ -224,6 +224,14 @@ class AlexaBridge:
             raise RuntimeError("Alexa bridge is not connected")
         await AlexaAPI(self._device(target), self.login).stop()
 
+    async def play_stream(self, target: str, stream_url: str) -> None:
+        from alexapy import AlexaAPI
+
+        if self.login is None:
+            raise RuntimeError("Alexa bridge is not connected")
+        device = self._device(target)
+        await AlexaAPI(device, self.login).run_custom(f"play {stream_url}")
+
 
 def alexa_targets_sync() -> list[Speaker]:
     async def run() -> list[Speaker]:

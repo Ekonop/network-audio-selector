@@ -106,7 +106,23 @@ class AudioRouter:
                     return mod_type == "module-null-sink" and f"sink_name={SINK_NAME}" in mod_args
         return False
 
+    def cleanup_loopbacks(self) -> None:
+        try:
+            res = subprocess.run(
+                ["pactl", "list", "short", "modules"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            for line in res.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3 and parts[1] == "module-loopback" and SINK_NAME in parts[2]:
+                    subprocess.run(["pactl", "unload-module", parts[0]], check=False)
+        except Exception:
+            pass
+
     def remove_virtual_sink(self) -> None:
+        self.cleanup_loopbacks()
         # Load any saved state if we don't have it in memory
         if self.previous_default_sink is None and self.state_file.exists():
             self._load_state()

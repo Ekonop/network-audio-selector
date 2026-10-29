@@ -211,6 +211,9 @@ class Selector(QWidget):
         self.install_snapcast_button.setObjectName("quiet")
         self.install_snapcast_button.clicked.connect(self.install_snapcast)
 
+        self.devices.itemChanged.connect(lambda _: self._update_route_button())
+        self.alexa_devices.itemChanged.connect(lambda _: self._update_route_button())
+
         self._build_layout()
         self.setStyleSheet(STYLE)
         self._health_timer = QTimer(self)
@@ -323,15 +326,30 @@ class Selector(QWidget):
         item.setText(label)
         item.setData(Qt.ItemDataRole.UserRole, speaker)
         if speaker.kind is SpeakerKind.ALEXA:
-            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            item.setCheckState(Qt.CheckState.Unchecked)
             self.alexa_devices.addItem(item)
         elif speaker.kind is SpeakerKind.SPOTIFY_CONNECT:
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.spotify_devices.addItem(item)
         else:
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             item.setCheckState(Qt.CheckState.Unchecked)
             self.devices.addItem(item)
+
+    def _update_route_button(self) -> None:
+        count = sum(
+            1
+            for widget in (self.devices, self.alexa_devices)
+            for index in range(widget.count())
+            if widget.item(index).checkState() == Qt.CheckState.Checked
+            and widget.item(index).data(Qt.ItemDataRole.UserRole) is not None
+        )
+        self.route_button.setEnabled(count > 0)
+        if count > 0:
+            self.route_button.setText(f"Start routing ({count} selected)")
+        else:
+            self.route_button.setText("Start routing")
 
     def _run_worker(self, worker: QObject) -> QThread:
         thread, _ = run_in_thread(worker)
@@ -369,10 +387,8 @@ class Selector(QWidget):
             if speaker.kind not in {SpeakerKind.ALEXA, SpeakerKind.SPOTIFY_CONNECT}
         ]
         if local_speakers:
-            self.route_button.setEnabled(True)
             self._set_status(f"{len(local_speakers)} local receiver(s) ready to select.")
         else:
-            self.route_button.setEnabled(False)
             empty = QListWidgetItem(
                 "No local receivers found\n"
                 "Use Connect Alexa for Echo devices, or check that Chromecast, "
@@ -384,6 +400,7 @@ class Selector(QWidget):
             self._set_status(
                 "Nothing is selected yet. Connect Alexa or refresh local speakers."
             )
+        self._update_route_button()
         if self.spotify_devices.count():
             self._set_status(
                 f"Detected {self.spotify_devices.count()} Spotify Connect receiver(s). "
@@ -504,6 +521,7 @@ class Selector(QWidget):
         for target in targets:
             self._add_speaker(target)
         self._set_status(f"Loaded {len(targets)} Alexa device/group target(s).")
+        self._update_route_button()
 
     def _on_alexa_failed(self, message: str) -> None:
         self.alexa_button.setEnabled(True)
@@ -583,6 +601,8 @@ class Selector(QWidget):
         )
         if not accepted or not redirect_url.strip():
             return
+        os.environ["NETWORK_AUDIO_ALEXA_IDENTIFIER"] = identifier
+        os.environ["NETWORK_AUDIO_ALEXA_DOMAIN"] = domain
         self._set_status("Completing Alexa connection in background…", busy=True)
         self.alexa_button.setEnabled(False)
         worker = AlexaBrowserSignInWorker(
@@ -629,6 +649,8 @@ class Selector(QWidget):
         code: str = "",
         domain: str = "amazon.com",
     ) -> None:
+        os.environ["NETWORK_AUDIO_ALEXA_IDENTIFIER"] = identifier
+        os.environ["NETWORK_AUDIO_ALEXA_DOMAIN"] = domain
         self._set_status("Signing in to Amazon in background…", busy=True)
         self.alexa_button.setEnabled(False)
         worker = AlexaSignInWorker(
@@ -784,10 +806,11 @@ class Selector(QWidget):
 
     def route(self) -> None:
         selected = [
-            self.devices.item(index).data(Qt.ItemDataRole.UserRole)
-            for index in range(self.devices.count())
-            if self.devices.item(index).checkState() == Qt.CheckState.Checked
-            and self.devices.item(index).data(Qt.ItemDataRole.UserRole) is not None
+            widget.item(index).data(Qt.ItemDataRole.UserRole)
+            for widget in (self.devices, self.alexa_devices)
+            for index in range(widget.count())
+            if widget.item(index).checkState() == Qt.CheckState.Checked
+            and widget.item(index).data(Qt.ItemDataRole.UserRole) is not None
         ]
         if not selected:
             self._set_status("Select at least one speaker before starting.", error=True)

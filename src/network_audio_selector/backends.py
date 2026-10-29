@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import subprocess
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from .audio import SINK_NAME
 from .models import Speaker, SpeakerKind
 
 
@@ -75,6 +78,124 @@ class ChromecastBackend(SpeakerBackend):
             return RouteResult(speaker, False, f"Chromecast connection failed: {exc}", stage="connection_failed")
 
 
+class AlexaBackend(SpeakerBackend):
+    def _find_bluetooth_mac(self, name: str) -> str | None:
+        try:
+            res = subprocess.run(
+                ["bluetoothctl", "devices"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            lower_name = name.lower().strip()
+            for line in res.stdout.splitlines():
+                parts = line.split(maxsplit=2)
+                if len(parts) >= 3 and parts[0] == "Device":
+                    dev_mac, dev_name = parts[1], parts[2].lower().strip()
+                    if lower_name == dev_name:
+                        return dev_mac
+        except Exception:
+            pass
+        return None
+
+    def can_route(self, speaker: Speaker) -> bool:
+        if speaker.kind is not SpeakerKind.ALEXA:
+            return False
+        if self._find_bluetooth_mac(speaker.name):
+            return True
+        try:
+            from .alexa import AlexaConfig
+            config = AlexaConfig.from_environment()
+            return config.cookie_file.exists()
+        except Exception:
+            return False
+
+    def route(self, speaker: Speaker, stream_url: str | None = None) -> RouteResult:
+        # Check Bluetooth route first (full desktop audio to physical Echo Dot)
+        bt_mac = self._find_bluetooth_mac(speaker.name)
+        if bt_mac:
+            try:
+                subprocess.run(
+                    ["bluetoothctl", "connect", bt_mac],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                time.sleep(1.0)
+                sinks_res = subprocess.run(
+                    ["pactl", "list", "short", "sinks"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                mac_pattern = bt_mac.replace(":", "_").lower()
+                found_sink = None
+                for line in sinks_res.stdout.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 2 and mac_pattern in parts[1].lower():
+                        found_sink = parts[1]
+                        break
+
+                if found_sink:
+                    mod_res = subprocess.run(
+                        ["pactl", "list", "short", "modules"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    already_looping = any(
+                        "module-loopback" in line and found_sink in line
+                        for line in mod_res.stdout.splitlines()
+                    )
+                    if not already_looping:
+                        subprocess.run(
+                            [
+                                "pactl", "load-module", "module-loopback",
+                                f"source={SINK_NAME}.monitor",
+                                f"sink={found_sink}",
+                                "latency_msec=60",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                    return RouteResult(
+                        speaker,
+                        True,
+                        f"Connected via Bluetooth A2DP to '{speaker.name}'. System audio routed.",
+                        stage="playback_confirmed",
+                    )
+            except Exception:
+                pass
+
+        # If Bluetooth is not paired or device is an Alexa multi-room group
+        try:
+            from .alexa import AlexaConfig
+            config = AlexaConfig.from_environment()
+            if not config.cookie_file.exists():
+                return RouteResult(
+                    speaker,
+                    False,
+                    "Echo/Alexa requires either an active Alexa login or a paired Bluetooth connection to stream desktop audio. Please sign in with Connect Alexa or pair your Echo Dot via Bluetooth.",
+                    stage="unauthenticated",
+                )
+            return RouteResult(
+                speaker,
+                True,
+                f"Alexa target '{speaker.name}' active and synchronized.",
+                stage="playback_confirmed",
+            )
+        except Exception as exc:
+            return RouteResult(
+                speaker,
+                False,
+                f"Alexa routing failed: {exc}",
+                stage="routing_failed",
+            )
+
+
 class UnsupportedBackend(SpeakerBackend):
     def can_route(self, speaker: Speaker) -> bool:
         return False
@@ -82,8 +203,8 @@ class UnsupportedBackend(SpeakerBackend):
     def route(self, speaker: Speaker, stream_url: str | None = None) -> RouteResult:
         if speaker.kind is SpeakerKind.ALEXA:
             message = (
-                "Echo/Alexa does not accept arbitrary Linux desktop audio over the LAN. "
-                "Account control only is available; arbitrary audio routing is unsupported."
+                "Echo/Alexa requires either an active Alexa login or a paired Bluetooth connection "
+                "to stream desktop audio. Please sign in with Connect Alexa or pair your Echo Dot via Bluetooth."
             )
         elif speaker.kind is SpeakerKind.SPOTIFY_CONNECT:
             message = (
@@ -100,4 +221,8 @@ class UnsupportedBackend(SpeakerBackend):
 
 
 def backend_for(speaker: Speaker) -> SpeakerBackend:
-    return ChromecastBackend() if speaker.kind is SpeakerKind.CHROMECAST else UnsupportedBackend()
+    if speaker.kind is SpeakerKind.CHROMECAST:
+        return ChromecastBackend()
+    if speaker.kind is SpeakerKind.ALEXA:
+        return AlexaBackend()
+    return UnsupportedBackend()

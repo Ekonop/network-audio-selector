@@ -54,6 +54,18 @@ class AlexaConfig:
             or os.environ.get("NETWORK_AUDIO_ALEXA_EMAIL", "").strip()
             or os.environ.get("NETWORK_AUDIO_ALEXA_PHONE", "").strip()
         )
+        cookie_dir = Path(
+            os.environ.get(
+                "NETWORK_AUDIO_ALEXA_COOKIE_DIR",
+                "~/.config/network-audio/alexa",
+            )
+        ).expanduser()
+        if not identifier and cookie_dir.exists():
+            for f in cookie_dir.glob("alexa_media.*.cookies"):
+                parts = f.name.split(".")
+                if len(parts) >= 3 and parts[1]:
+                    identifier = parts[1]
+                    break
         if not identifier:
             raise RuntimeError(
                 "Set NETWORK_AUDIO_ALEXA_EMAIL or NETWORK_AUDIO_ALEXA_PHONE before using Alexa account control."
@@ -61,16 +73,14 @@ class AlexaConfig:
         return cls(
             identifier=identifier,
             domain=os.environ.get("NETWORK_AUDIO_ALEXA_DOMAIN", "amazon.com").strip(),
-            cookie_dir=Path(
-                os.environ.get(
-                    "NETWORK_AUDIO_ALEXA_COOKIE_DIR",
-                    "~/.config/network-audio/alexa",
-                )
-            ).expanduser(),
+            cookie_dir=cookie_dir,
         )
 
     @property
     def cookie_file(self) -> Path:
+        direct = self.cookie_dir / f"alexa_media.{self.identifier}.cookies"
+        if direct.exists():
+            return direct
         safe_id = "".join(c if c.isalnum() or c in ".-_@" else "_" for c in self.identifier)
         return self.cookie_dir / f"alexa_media.{safe_id}.cookies"
 

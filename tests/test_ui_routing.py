@@ -201,3 +201,59 @@ def test_ui_route_transactional_rollback_when_backend_fails(qapp):
         assert selector.route_button.text() == "Routing failed"
 
     selector.close()
+
+
+def test_ui_route_supports_alexa_devices(qapp):
+    fake_health = HealthReport(
+        phase=SourcePhase.TRANSPORT_ACTIVE,
+        sink_exists=True,
+        sink_is_default=True,
+        snapserver_running=True,
+        ffmpeg_running=True,
+        stream_status="playing",
+        detail="Active",
+    )
+    with patch.object(Selector, "refresh"):
+        selector = Selector()
+    selector.source = MagicMock()
+    selector.source.is_running = True
+    selector.source.health.return_value = fake_health
+
+    alexa_spk = Speaker(
+        id="alexa:1",
+        name="Everywhere",
+        kind=SpeakerKind.ALEXA,
+        note="Alexa multi-room group",
+    )
+    selector._add_speaker(alexa_spk)
+
+    assert selector.alexa_devices.count() == 1
+    alexa_item = selector.alexa_devices.item(0)
+    assert bool(alexa_item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+    assert alexa_item.checkState() == Qt.CheckState.Unchecked
+
+    # Checking item enables route button
+    alexa_item.setCheckState(Qt.CheckState.Checked)
+    selector._update_route_button()
+    assert selector.route_button.isEnabled()
+    assert "1 selected" in selector.route_button.text()
+
+    mock_alexa_backend = MagicMock()
+    mock_alexa_backend.can_route.return_value = True
+    mock_alexa_backend.route.return_value = RouteResult(
+        alexa_spk, True, "Alexa group synchronized", stage="playback_confirmed"
+    )
+
+    with patch("network_audio_selector.ui.backend_for", return_value=mock_alexa_backend), \
+         patch("network_audio_selector.ui.AudioStream") as mock_stream_cls:
+        mock_stream = MagicMock()
+        mock_stream.start.return_value = "http://127.0.0.1:8000/audio.mp3"
+        mock_stream_cls.return_value = mock_stream
+
+        selector.route()
+
+        mock_alexa_backend.route.assert_called_once()
+        assert selector.route_button.text() == "Routing active"
+        assert "Routing audio to 1 selected speaker(s)." in selector.status.text()
+
+    selector.close()

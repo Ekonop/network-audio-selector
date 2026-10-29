@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -20,3 +22,5 @@ class Speaker:
     path: str | None = None
     available: bool = True
     note: str | None = None
+    addresses: tuple[str, ...] = ()
+    supports_routing: bool = False

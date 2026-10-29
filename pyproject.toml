@@ -21,6 +21,7 @@ network-audio-service = "network_audio_selector.service:main"
 
 [project.optional-dependencies]
 alexa = ["alexapy>=1.33,<2"]
+test = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

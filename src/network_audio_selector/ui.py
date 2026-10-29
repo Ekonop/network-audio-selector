@@ -28,10 +28,7 @@ from PyQt6.QtWidgets import (
 
 from .alexa import (
     AlexaConfig,
-    AlexaVerificationRequired,
-    alexa_browser_sign_in_sync,
     alexa_login_url,
-    alexa_sign_in_sync,
 )
 from .audio import AudioRouter
 from .backends import backend_for
@@ -41,6 +38,8 @@ from .snapcast import SnapcastManager, SnapcastUnavailable
 from .source import PHASE_LABELS, HealthReport, SourceController, SourcePhase
 from .stream import AudioStream
 from .workers import (
+    AlexaBrowserSignInWorker,
+    AlexaSignInWorker,
     AlexaTargetsWorker,
     DiscoveryWorker,
     SourceStartWorker,
@@ -341,7 +340,6 @@ class Selector(QWidget):
         self.refresh_button.setEnabled(False)
         self.devices.clear()
         self.spotify_devices.clear()
-        # Keep Alexa targets already loaded unless user reconnects.
         self._set_status("Looking for speakers on your network…", busy=True)
         worker = DiscoveryWorker()
         worker.finished.connect(self._on_discovery_finished)
@@ -524,17 +522,13 @@ class Selector(QWidget):
         )
         if not accepted or not redirect_url.strip():
             return
-        self._set_status("Completing Alexa connection…", busy=True)
-        try:
-            targets = alexa_browser_sign_in_sync(email, redirect_url)
-        except Exception as exc:
-            self._set_status(str(exc), error=True)
-            QMessageBox.warning(self, "Alexa connection failed", str(exc))
-            return
-        self.alexa_devices.clear()
-        for target in targets:
-            self._add_speaker(target)
-        self._set_status(f"Loaded {len(targets)} Alexa device/group target(s).")
+        self._set_status("Completing Alexa connection in background…", busy=True)
+        self.alexa_button.setEnabled(False)
+        worker = AlexaBrowserSignInWorker(email, redirect_url.strip())
+        worker.finished.connect(self._on_alexa_targets)
+        worker.failed.connect(self._on_alexa_failed)
+        thread, _ = run_in_thread(worker)
+        self._threads.append(thread)
 
     def _sign_in_alexa(self, email: str) -> None:
         dialog = QDialog(self)
@@ -573,35 +567,33 @@ class Selector(QWidget):
         form.addRow(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted or not password.text():
             return
-        self._set_status("Signing in to Amazon…", busy=True)
-        try:
-            os.environ["NETWORK_AUDIO_ALEXA_DOMAIN"] = region.currentData()
-            targets = alexa_sign_in_sync(email, password.text())
-        except AlexaVerificationRequired:
-            code, accepted = QInputDialog.getText(
-                self,
-                "Amazon verification",
-                "Enter the code Amazon sent you:",
-                QLineEdit.EchoMode.Normal,
-            )
-            if not accepted or not code.strip():
-                self._set_status("Amazon verification was cancelled.", error=True)
-                return
-            self._set_status("Verifying code with Amazon…", busy=True)
-            try:
-                targets = alexa_sign_in_sync(email, password.text(), code.strip())
-            except Exception as exc:
-                self._set_status(str(exc), error=True)
-                QMessageBox.warning(self, "Amazon sign-in failed", str(exc))
-                return
-        except Exception as exc:
-            self._set_status(str(exc), error=True)
-            QMessageBox.warning(self, "Amazon sign-in failed", str(exc))
+        os.environ["NETWORK_AUDIO_ALEXA_DOMAIN"] = region.currentData()
+        self._start_alexa_credential_signin(email, password.text())
+
+    def _start_alexa_credential_signin(self, email: str, password: str, code: str = "") -> None:
+        self._set_status("Signing in to Amazon in background…", busy=True)
+        self.alexa_button.setEnabled(False)
+        worker = AlexaSignInWorker(email, password, code)
+        worker.finished.connect(self._on_alexa_targets)
+        worker.failed.connect(self._on_alexa_failed)
+        worker.verification_required.connect(
+            lambda msg: self._on_alexa_verification_required(email, password, msg)
+        )
+        thread, _ = run_in_thread(worker)
+        self._threads.append(thread)
+
+    def _on_alexa_verification_required(self, email: str, password: str, message: str) -> None:
+        self.alexa_button.setEnabled(True)
+        code, accepted = QInputDialog.getText(
+            self,
+            "Amazon verification",
+            f"{message}\n\nEnter the code Amazon sent you:",
+            QLineEdit.EchoMode.Normal,
+        )
+        if not accepted or not code.strip():
+            self._set_status("Amazon verification was cancelled.", error=True)
             return
-        self.alexa_devices.clear()
-        for target in targets:
-            self._add_speaker(target)
-        self._set_status(f"Loaded {len(targets)} Alexa device/group target(s).")
+        self._start_alexa_credential_signin(email, password, code.strip())
 
     def start_source(self) -> None:
         if self._busy:
@@ -743,15 +735,35 @@ class Selector(QWidget):
                 stream_url = self.stream.url
             results = [backend_for(speaker).route(speaker, stream_url) for speaker in selected]
         except Exception as exc:
+            self.route_button.setText("Routing failed")
             self._set_status(f"Routing failed: {exc}", error=True)
             self.refresh_health()
             return
-        failed = [result.message for result in results if not result.ok]
-        if failed:
-            self._set_status(" · ".join(failed), error=True)
+
+        succeeded = [result for result in results if result.ok]
+        failed = [result for result in results if not result.ok]
+
+        if not succeeded:
+            self.route_button.setText("Routing failed")
+            failure_lines = [f"{r.speaker.name}: {r.message}" for r in failed]
+            self._set_status("Routing failed: " + " · ".join(failure_lines), error=True)
+            QMessageBox.warning(
+                self,
+                "Routing Failed",
+                "None of the selected speakers could be routed:\n\n"
+                + "\n\n".join(f"• {r.speaker.name} ({r.speaker.kind.value}):\n  {r.message}" for r in failed),
+            )
+        elif failed:
+            self.route_button.setText(f"Routing active ({len(succeeded)}/{len(selected)})")
+            succ_names = ", ".join(r.speaker.name for r in succeeded)
+            fail_details = "; ".join(f"{r.speaker.name}: {r.message}" for r in failed)
+            self._set_status(
+                f"Routing active to {succ_names}. Failed: {fail_details}",
+                error=True,
+            )
         else:
+            self.route_button.setText("Routing active")
             self._set_status(f"Routing audio to {len(selected)} selected speaker(s).")
-        self.route_button.setText("Routing active")
         self.refresh_health()
 
     def refresh_health(self) -> None:
@@ -778,7 +790,7 @@ class Selector(QWidget):
         lines.append(report.detail)
         self.health_label.setText("\n".join(lines))
 
-        running = report.phase is not SourcePhase.IDLE or self.source.is_running
+        running = report.phase not in {SourcePhase.IDLE, SourcePhase.ERROR} or self.source.is_running
         transport_ready = report.snapserver_running
         self.start_source_button.setEnabled(not self.source.is_running and not self._busy)
         self.stop_source_button.setEnabled(running and not self._busy)
@@ -803,6 +815,11 @@ class Selector(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._health_timer.stop()
+        for thread in list(self._threads):
+            if hasattr(thread, "isRunning") and thread.isRunning():
+                thread.quit()
+                thread.wait(500)
+        self._threads.clear()
         if self.stream is not None:
             self.stream.stop()
             self.stream = None

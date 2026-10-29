@@ -2,137 +2,112 @@
 
 ## Purpose
 
-Network Audio Selector is a Linux desktop app intended to route arbitrary
+Network Audio Selector is a Linux desktop application intended to route arbitrary
 system audio to network speakers. The target experience is Spotify-like:
 choose one or more receivers, keep applications playing normally, and send
 the system mix to those receivers.
 
-## Current product decision
+## Verified Environment
 
-The project uses a hybrid architecture:
+- Repository: `/home/vansh/Projects/network-audio-selector`
+- Branch: `main`
+- Host: Arch Linux / CachyOS (x86_64), KDE Plasma
+- PipeWire 1.6.10 with PulseAudio compatibility layer
+- Python 3.14.0 in `.venv`
+- Native Snapcast 0.35.0 (`snapserver` and `snapclient` installed at `/usr/bin/`)
+- Native FFmpeg (`/usr/bin/ffmpeg`) and PulseAudio control (`/usr/bin/pactl`)
+- Local network: Discovered two Amazon Echo Dots via `_spotify-connect._tcp`:
+  - `Black Echo Dot` at `10.42.0.24:4070`
+  - `Vansh's Echo Dot` at `10.42.0.254:4070`
 
-1. **Snapcast** is the transport for arbitrary Linux system audio and
-   synchronized playback.
-2. **Chromecast, AirPlay, and UPnP** are ecosystem-specific adapters. Discovery
-   exists, but sender support is incomplete except for the initial Chromecast
-   path.
-3. **Alexa/Echo** is an account-control integration only. Amazon's consumer
-   Alexa APIs do not expose a supported arbitrary desktop-audio input for Echo
-   devices or groups.
-4. **Spotify Connect discovery** identifies receivers but does not turn them
-   into generic Linux audio sinks.
+## Verified Functionality
 
-Do not present Alexa or Spotify Connect discovery as proof that raw Linux audio
-can be sent to Echo devices.
+1. **Virtual PipeWire/PulseAudio Sink & Restoration**:
+   - Virtual sink creation: `network_audio_selector` with monitor `network_audio_selector.monitor`.
+   - Safely adopts pre-existing virtual sink without destroying it upon exit.
+   - Records and preserves previous default sink in `~/.local/state/network-audio/sink_state.json`.
+   - Restores the original physical output on clean shutdown, partial startup failures, or emergency recovery.
+   - If previous sink is disconnected, safely falls back to the first available physical sink.
 
-## Verified environment
+2. **mDNS Discovery & Receiver Identification**:
+   - Discovers Chromecast, AirPlay, UPnP, and Spotify Connect services.
+   - Preserves all resolved IPv4 and IPv6 addresses.
+   - Properly handles IPv6 endpoints with bracketed URL notation (`http://[<ipv6>]:<port>/...`).
+   - Discovers Echo Dot devices via Spotify Connect `getInfo` probe and resolves friendly names (`Black Echo Dot`, `Vansh's Echo Dot`).
+   - Does NOT silently assume `/zeroconf` when `CPath` is absent; records a clear diagnostic note.
+   - Service removal correctly checks both protocol kind and service name.
 
-- Project: `/home/vansh/Projects/network-audio-selector`
-- Python environment: `.venv`
-- PipeWire 1.6.10 with PulseAudio compatibility
-- Python 3.14
-- Snapcast 0.35.0 installed from AUR
-- Snapserver and Snapclient binaries are available
-- Two local `_spotify-connect._tcp` advertisements were observed:
-  - `10.42.0.24:4070/spotifyConnect`
-  - `10.42.0.254:4070/spotifyConnect`
-- Both returned valid Spotify `getInfo` responses identifying Amazon `Echo_Dot`
+3. **Snapcast Synchronized Audio Pipeline**:
+   - Local `snapserver` configuration generated with `Linux System Audio` pipe stream.
+   - FFmpeg captures 48,000 Hz 16-bit stereo PCM from `network_audio_selector.monitor` directly into the FIFO without blocking.
+   - FFmpeg startup failures or early exits are caught immediately with stderr diagnostics.
+   - Stale PID files are verified against `/proc/<pid>/cmdline` and reaped safely.
+   - Control port conflicts (1705 occupied by an external service) are detected and reported clearly.
+   - Local `snapclient` test mode routes audio through the physical hardware sink to avoid loopback feedback.
 
-## What is currently working
+4. **Discrete Source Health Model**:
+   - Six distinct health phases:
+     - `idle`: source is stopped.
+     - `source_active`: virtual sink created and set as default.
+     - `transport_active`: Snapserver and FFmpeg encoder running.
+     - `receiver_connected`: at least one Snapclient connected.
+     - `playback_confirmed`: PCM audio confirmed flowing and stream is `playing`.
+     - `error`: specific failure stage and error details reported.
+   - Source probe tone verifies stream transition to `playing` and catches silence vs. broken pipeline.
 
-- Virtual PipeWire/PulseAudio sink creation:
-  - Sink: `network_audio_selector`
-  - Monitor: `network_audio_selector.monitor`
-- Default sink switching and restoration.
-- mDNS discovery for Chromecast, AirPlay/RAOP, UPnP/DIAL, and Spotify Connect.
-- Read-only Spotify Connect `getInfo` identification.
-- Snapserver configuration generation.
-- FFmpeg capture from the virtual sink monitor into a Snapcast PCM FIFO.
-- Local Snapserver startup with control-port readiness checks.
-- **Source state machine** with distinct phases:
-  - `idle`
-  - `source_active`
-  - `transport_active`
-  - `receiver_connected`
-  - `playback_confirmed`
-- Health indicators in the UI and via `network-audio source status`.
-- **Local Snapclient test mode** that plays through the previous physical sink
-  (avoids feedback into the virtual sink).
-- Verified end-to-end path: source start → local Snapclient →
-  `playback_confirmed` with stream status `playing`.
-- Explicit start/stop source controls and cleanup on app close.
-- Discovery and source start/stop moved off the Qt GUI thread.
-- PyQt6 UI construction and CLI startup checks.
-- Alexa session/login boundary and account target listing when a valid session is
-  available.
+5. **HTTP MP3 Stream**:
+   - Bound to `127.0.0.1` by default for local testing; explicit warnings documented for untrusted LAN use.
+   - Deterministic shutdown: closes client queues, terminates/kills FFmpeg, joins reader thread, shuts down HTTP server, and joins HTTP thread without deadlock or resource leaks.
 
-## What is not complete
+6. **Truthful UI and Non-blocking Background Operations**:
+   - Route button never says `Routing active` if all selected backends fail; displays `Routing failed` with per-device error details.
+   - Shows truthful partial routing if some succeed and some fail (`Routing active (X/Y)`).
+   - Echo Dot devices and Spotify Connect receivers are explicitly presented as unsupported for arbitrary desktop Linux audio.
+   - Alexa browser OAuth URL processing and credential sign-in run asynchronously off the Qt GUI thread in `AlexaBrowserSignInWorker` and `AlexaSignInWorker`.
 
-- The UI does not yet provision or launch Snapclients on Echo devices.
-- Echo groups such as `Everywhere` and `Bedroom` cannot be used as arbitrary
-  Linux audio outputs through the current public/private API boundary.
-- Chromecast live routing has not been validated against a physical Chromecast.
-- AirPlay and UPnP sender implementations are incomplete.
-- Alexa login still has interactive/browser steps on the GUI thread.
-- The HTTP MP3 stream is unauthenticated and should remain a trusted-LAN
-  experiment, not the primary transport.
-- Remote Snapclient provisioning / second-machine documentation still needs a
-  polished guided flow in the UI.
+## Confirmed Boundaries and Non-arbitrary Receiver Limitations
 
-## Reproduce the current state
+1. **Echo / Alexa Devices**:
+   - Discovered through Spotify Connect and Alexa account targets.
+   - Amazon does not provide a public or local API to accept generic live PCM/MP3 streams from a Linux host.
+   - Spotify Connect discovery only allows Spotify client handoff, not desktop audio forwarding.
+   - Echo devices are explicitly marked as unsupported for arbitrary system audio in the UI and CLI.
+   - For physical playback, a receiver must run `snapclient` or a complete ecosystem sender (e.g., Chromecast).
+
+2. **Chromecast / AirPlay / UPnP**:
+   - Chromecast backend implemented via `pychromecast` with live HTTP stream URL.
+   - AirPlay and UPnP sender implementations remain stubbed as unsupported until verified against physical hardware.
+
+## Reproducing Verification
+
+Run the full automated test suite (27 tests):
 
 ```bash
 cd /home/vansh/Projects/network-audio-selector
 .venv/bin/python -m compileall -q src
-.venv/bin/network-audio devices
-.venv/bin/network-audio source status
+.venv/bin/pytest -q
+```
+
+Run the Qt offscreen smoke test:
+
+```bash
 QT_QPA_PLATFORM=offscreen .venv/bin/python -c \
   'from PyQt6.QtWidgets import QApplication; from network_audio_selector.ui import Selector; app=QApplication([]); w=Selector(); print("ui-ok"); w.close()'
 ```
 
-Start the UI:
+Verify device discovery on the local network:
 
 ```bash
-.venv/bin/network-audio-ui
+.venv/bin/network-audio devices
 ```
 
-Verify the synchronized source path end-to-end on this machine:
+Verify local synchronized playback end-to-end:
 
 ```bash
 .venv/bin/network-audio source start
-# in another terminal:
+# in another shell:
 .venv/bin/network-audio source test-client
 .venv/bin/network-audio source probe
 .venv/bin/network-audio source status
-# expect phase=playback_confirmed after the probe tone
 .venv/bin/network-audio source stop
 ```
-
-If no app is playing into the virtual sink, PipeWire may suspend the
-monitor and Snapcast stays `idle` even with a connected client. Use
-`source probe` (or the UI **Probe tone** button) to inject a short tone.
-
-## Recommended next implementation order
-
-1. Document / UI-guide a second Linux Snapclient on another machine.
-2. Move remaining Alexa interactive login work off the GUI thread where practical.
-3. Harden or remove the unauthenticated HTTP stream.
-4. Add receiver-specific adapters only after their transport and permissions are
-   independently verified.
-5. Validate Chromecast routing against a physical device.
-
-## Important files
-
-| File | Responsibility |
-|---|---|
-| `src/network_audio_selector/ui.py` | Qt UI and user flow |
-| `src/network_audio_selector/source.py` | Source lifecycle state machine + health |
-| `src/network_audio_selector/workers.py` | Background discovery/source workers |
-| `src/network_audio_selector/audio.py` | Virtual sink and default output |
-| `src/network_audio_selector/snapcast.py` | Snapserver, FIFO, FFmpeg, local Snapclient |
-| `src/network_audio_selector/discovery.py` | mDNS/DNS-SD discovery |
-| `src/network_audio_selector/spotify.py` | Read-only Spotify Connect probing |
-| `src/network_audio_selector/backends.py` | Receiver routing adapters |
-| `src/network_audio_selector/alexa.py` | Alexa account/session controls |
-| `src/network_audio_selector/stream.py` | Experimental HTTP MP3 stream |
-| `src/network_audio_selector/cli.py` | Command-line entry point |

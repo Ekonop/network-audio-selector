@@ -14,6 +14,7 @@ class SourcePhase(StrEnum):
     TRANSPORT_ACTIVE = "transport_active"
     RECEIVER_CONNECTED = "receiver_connected"
     PLAYBACK_CONFIRMED = "playback_confirmed"
+    ERROR = "error"
 
 
 PHASE_LABELS = {
@@ -22,6 +23,7 @@ PHASE_LABELS = {
     SourcePhase.TRANSPORT_ACTIVE: "Transport active",
     SourcePhase.RECEIVER_CONNECTED: "Receiver connected",
     SourcePhase.PLAYBACK_CONFIRMED: "Playback confirmed",
+    SourcePhase.ERROR: "Error",
 }
 
 
@@ -54,23 +56,41 @@ class SourceController:
         self.router = router or AudioRouter()
         self.snapcast = snapcast or SnapcastManager()
         self._wanted_running = False
+        self.last_error: str | None = None
+        self.error_stage: SourcePhase | None = None
 
     @property
     def is_running(self) -> bool:
         return self._wanted_running
 
     def start(self) -> HealthReport:
-        self.router.create_virtual_sink()
-        self.router.set_default()
+        self.last_error = None
+        self.error_stage = None
+        try:
+            self.router.create_virtual_sink()
+            self.router.set_default()
+        except Exception as exc:
+            self.last_error = f"Virtual sink creation failed: {exc}"
+            self.error_stage = SourcePhase.SOURCE_ACTIVE
+            self._wanted_running = False
+            self.router.remove_virtual_sink()
+            raise
+
         try:
             self.snapcast.start()
-        except SnapcastUnavailable:
+        except Exception as exc:
+            self.last_error = f"Snapcast transport failed: {exc}"
+            self.error_stage = SourcePhase.TRANSPORT_ACTIVE
             self._wanted_running = False
+            self.router.remove_virtual_sink()
             raise
+
         self._wanted_running = True
         return self.health()
 
     def stop(self) -> HealthReport:
+        self.last_error = None
+        self.error_stage = None
         self.snapcast.stop_local_client()
         self.snapcast.stop()
         self.router.remove_virtual_sink()
@@ -86,13 +106,13 @@ class SourceController:
     def stop_local_test_client(self) -> None:
         self.snapcast.stop_local_client()
 
-    def probe(self, seconds: float = 2.0) -> HealthReport:
+    def probe(self, seconds: float = 2.5) -> HealthReport:
         """Inject a short tone and sample health while PCM is flowing."""
         if not self._wanted_running and not self.snapcast.is_server_alive():
             raise SnapcastUnavailable("Start the source before probing playback.")
         process = self.router.start_probe_tone(seconds=seconds)
         best = self.health()
-        deadline = time.monotonic() + seconds + 0.5
+        deadline = time.monotonic() + seconds + 0.8
         try:
             while time.monotonic() < deadline:
                 report = self.health()
@@ -106,7 +126,7 @@ class SourceController:
                     best = report
                 if process.poll() is not None and time.monotonic() > deadline - 0.4:
                     break
-                time.sleep(0.2)
+                time.sleep(0.15)
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -148,7 +168,16 @@ class SourceController:
         receiver_ok = bool(clients)
         playback_ok = transport_ok and receiver_ok and stream_playing
 
-        if playback_ok:
+        if self.last_error and not self._wanted_running:
+            phase = SourcePhase.ERROR
+            detail = self.last_error
+        elif self._wanted_running and not source_ok:
+            phase = SourcePhase.ERROR
+            detail = "Virtual sink was dropped or changed unexpectedly."
+        elif self._wanted_running and not transport_ok:
+            phase = SourcePhase.ERROR
+            detail = "Snapcast transport stopped unexpectedly while source was active."
+        elif playback_ok:
             phase = SourcePhase.PLAYBACK_CONFIRMED
             detail = (
                 f"PCM is flowing and {len(clients)} Snapclient(s) are connected: "
@@ -172,6 +201,7 @@ class SourceController:
         else:
             phase = SourcePhase.IDLE
             if self._wanted_running:
+                phase = SourcePhase.ERROR
                 detail = "Source was started, but the sink or transport dropped."
             else:
                 detail = "Source is stopped. Start source to create the sink and Snapcast transport."
